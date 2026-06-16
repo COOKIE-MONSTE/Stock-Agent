@@ -1,0 +1,18 @@
+# Local environment configurations (private keys)
+.env
+
+# Local test outputs
+last_report.html
+comparison_chart.png
+test_chart.png
+last_report.html.bak
+
+# Python compiler files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Operating system files
+.DS_Store
+Thumbs.db
