@@ -3,10 +3,29 @@ import urllib.request
 import xml.etree.ElementTree as ET
 import datetime
 import os
+import pandas as pd
 import matplotlib
 # Use the non-interactive Agg backend to avoid GUI window popup issues on Windows/servers
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
+def _get_fx_rate(from_currency, to_currency):
+    """
+    Fetches a spot FX rate to convert an amount in `from_currency` into `to_currency`,
+    using yfinance currency-pair tickers (e.g. 'GBPUSD=X').
+    Returns 1.0 if no conversion is needed, or None if a rate can't be fetched.
+    """
+    if not from_currency or not to_currency or from_currency == to_currency:
+        return 1.0
+    try:
+        pair = yf.Ticker(f"{from_currency}{to_currency}=X")
+        hist = pair.history(period="5d")
+        if not hist.empty:
+            return float(hist['Close'].iloc[-1])
+        return None
+    except Exception as e:
+        print(f"Warning: Could not fetch FX rate {from_currency}->{to_currency}: {e}")
+        return None
 
 def fetch_bti_data():
     """
@@ -44,8 +63,32 @@ def fetch_bti_data():
         data['fifty_two_week_low'] = info.get('fiftyTwoWeekLow')
         data['fifty_two_week_high'] = info.get('fiftyTwoWeekHigh')
         
-        # EV/EBITDA multiple (new user request)
-        data['ev_ebitda'] = info.get('enterpriseToEbitda')
+        # EV/EBITDA multiple
+        # NOTE: BTI is a USD-denominated ADR, but British American Tobacco p.l.c.
+        # reports its actual financials in GBP. Yahoo's pre-computed 'enterpriseToEbitda'
+        # mixes the USD-based enterprise value with GBP-denominated EBITDA without
+        # converting currencies first, which distorts the multiple. We recompute it
+        # manually, converting debt/cash/EBITDA into the listing currency first.
+        listing_currency = info.get('currency')              # e.g. 'USD'
+        financial_currency = info.get('financialCurrency')   # e.g. 'GBP'
+        market_cap = info.get('marketCap')
+        total_debt = info.get('totalDebt') or 0
+        total_cash = info.get('totalCash') or 0
+        ebitda_raw = info.get('ebitda')
+
+        corrected_ev_ebitda = None
+        if market_cap and ebitda_raw:
+            fx_rate = _get_fx_rate(financial_currency, listing_currency)
+            if fx_rate:
+                ebitda_converted = ebitda_raw * fx_rate
+                if ebitda_converted:
+                    enterprise_value = market_cap + (total_debt * fx_rate) - (total_cash * fx_rate)
+                    corrected_ev_ebitda = round(enterprise_value / ebitda_converted, 2)
+            else:
+                print("Warning: FX rate unavailable; falling back to Yahoo's raw EV/EBITDA (may be currency-mismatched).")
+
+        data['ev_ebitda_yahoo_raw'] = info.get('enterpriseToEbitda')  # kept for comparison/debugging
+        data['ev_ebitda'] = corrected_ev_ebitda if corrected_ev_ebitda is not None else info.get('enterpriseToEbitda')
         
         # Format metrics
         if data['dividend_yield']:
@@ -135,42 +178,60 @@ def generate_comparison_chart(output_path):
     """
     print("Generating 5-day stock performance chart...")
     tickers = {"BTI": "BTI", "Altria (MO)": "MO", "Philip Morris (PM)": "PM"}
-    
+
+    # Fetch each ticker's close prices first. We collect them into one table and
+    # keep only the days where *every* ticker has a price. Plotting each ticker
+    # independently (as before) meant a single missing/NaN day for one ticker
+    # (e.g. PM) would either break its line into two disconnected segments, or
+    # leave it misaligned against the other two on the shared date axis -- both
+    # of which can look like an extra/duplicate line.
+    closes_by_label = {}
+    for label, ticker_sym in tickers.items():
+        ticker = yf.Ticker(ticker_sym)
+        hist = ticker.history(period="7d")
+        hist = hist.dropna(subset=['Close'])
+        if hist.empty:
+            print(f"Warning: No historical data found for {ticker_sym}")
+            continue
+        series = hist['Close'].copy()
+        series.index = series.index.normalize()  # drop intraday timestamps so dates align across tickers
+        closes_by_label[label] = series
+
+    if not closes_by_label:
+        print("Error: No historical data available for any ticker; skipping chart.")
+        return
+
+    # Combine into one table, keep only days shared by all tickers, take the last 5.
+    combined = pd.DataFrame(closes_by_label).dropna(how='any')
+    combined = combined.tail(5)
+
+    if combined.empty:
+        print("Error: No overlapping trading days found across tickers; skipping chart.")
+        return
+
     plt.figure(figsize=(8, 4))
     # Set background styling to look premium (soft grey/white)
     plt.gcf().set_facecolor('#f8fafc')
     ax = plt.axes()
     ax.set_facecolor('#ffffff')
-    
+
     colors = {"BTI": "#4f46e5", "Altria (MO)": "#f43f5e", "Philip Morris (PM)": "#0d9488"}
     linestyles = {"BTI": "-", "Altria (MO)": "--", "Philip Morris (PM)": "-."}
     widths = {"BTI": 2.5, "Altria (MO)": 1.5, "Philip Morris (PM)": 1.5}
-    
-    # We want exactly 5 trading days. We fetch 7 days to guarantee 5 trading days.
-    for label, ticker_sym in tickers.items():
-        ticker = yf.Ticker(ticker_sym)
-        hist = ticker.history(period="7d")
-        
-        # Take the last 5 trading days
-        if len(hist) > 5:
-            hist = hist.tail(5)
-            
-        if hist.empty:
-            print(f"Warning: No historical data found for {ticker_sym}")
-            continue
-            
-        closes = hist['Close']
+
+    # Format the dates for x-axis (e.g. '06/12')
+    dates = [d.strftime('%m/%d') for d in combined.index]
+
+    for label in combined.columns:
+        closes = combined[label]
         base_price = closes.iloc[0]
         # Normalize to percent change starting at 0%
         pct_change = ((closes / base_price) - 1) * 100
-        
-        # Format the dates for x-axis (e.g. '06/12')
-        dates = [d.strftime('%m/%d') for d in pct_change.index]
-        
-        plt.plot(dates, pct_change.values, 
-                 label=label, 
-                 color=colors[label], 
-                 linestyle=linestyles[label], 
+
+        plt.plot(dates, pct_change.values,
+                 label=label,
+                 color=colors[label],
+                 linestyle=linestyles[label],
                  linewidth=widths[label],
                  marker='o' if label == "BTI" else None)
         
