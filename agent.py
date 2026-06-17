@@ -1,9 +1,12 @@
 import os
+import time
+import datetime
 from google import genai
 from google.genai import types
+from google.genai.errors import ServerError, APIError
 from dotenv import load_dotenv
 import data_fetcher
-import datetime
+from stocks_config import STOCKS
 
 # Load configuration
 load_dotenv()
@@ -30,29 +33,43 @@ def clean_html_output(text):
         text = text[:-3]
     return text.strip()
 
-def generate_bti_report():
-    """
-    Main agent pipeline:
-    1. Fetches BTI stock metrics and news.
-    2. Runs analysis with Gemini.
-    3. Outputs clean HTML showing EV/EBITDA, 3 custom regulatory points,
-       and top news headlines alongside the comparison chart placeholder.
-    """
-    print("Gathering real-time market data...")
-    stock_data = data_fetcher.fetch_bti_data()
-    
-    print("Gathering news and global regulatory updates...")
-    reg_news = data_fetcher.fetch_regulatory_news()
-    
-    if 'error' in stock_data:
-        print(f"Warning: Stock data fetch had issues: {stock_data['error']}")
+# This is now company-agnostic: Gemini is asked to find the three most
+# relevant catalysts/risks FOR WHATEVER COMPANY it's given, rather than
+# being told fixed categories (the old prompt's "FDA / illicit vape / ex-US"
+# only made sense for BTI). Per-company search queries in stocks_config.py
+# still steer the *kind* of news each company gets, so quality/relevance is
+# preserved even though the prompt itself is generic.
+STOCK_SECTION_SYSTEM_INSTRUCTION = """
+You are an elite equity analyst producing one section of a daily multi-stock
+investor briefing email. You will be given data for ONE company at a time.
 
+Your output MUST be a single self-contained HTML fragment (a <div>...</div>)
+with inline CSS styles only. Do NOT include <html>, <head>, or <body> tags,
+and do not output markdown backticks or any text outside the <div>.
+
+Visual style (match this exactly so every company's card looks consistent):
+- White card, 16px border-radius, 1px solid #e2e8f0 border, 20px padding, 18px bottom margin, font-family 'Segoe UI', Arial, sans-serif.
+- Header row inside the card: company name + ticker in bold #1A365D, with current price, daily % change (use #16a34a for positive, #dc2626 for negative), and EV/EBITDA multiple shown on the same line or right-aligned.
+
+Structure inside the card:
+1. Executive Summary: exactly 2 sentences summarizing the stock's current state.
+2. Key Catalysts & Risks: EXACTLY three bullet points. These should be the three most relevant, market-moving items for THIS SPECIFIC company drawn from the news provided -- they may be regulatory, legal/antitrust, demand or guidance related, competitive, or M&A. Do not force categories that don't fit; choose whichever three are genuinely most relevant based on the supplied data.
+3. Key News: the top 2-3 most critical, highest-impact headlines (prefer trustworthy sources like Reuters, Bloomberg, WSJ) as active clickable hyperlinks.
+
+Be factual and concise. Base everything on the data given; never fabricate figures, news, or sources.
+"""
+
+def generate_stock_section(ticker, info, stock_data, news_items):
+    """
+    Calls Gemini once for a single stock and returns just its HTML card
+    (a fragment, not a full document) at the same analytical depth the
+    original single-stock report had.
+    """
     client = get_gemini_client()
-    current_date = datetime.datetime.now().strftime("%B %d, %Y")
-    
-    # Format inputs for the prompt
+    display_name = info.get("display_name", ticker)
+
     stock_info_str = f"""
-    Ticker: BTI (British American Tobacco p.l.c. ADR)
+    Ticker: {ticker} ({display_name})
     Current Price: ${stock_data.get('price', 'N/A')}
     Daily Change: ${stock_data.get('change', 'N/A')} ({stock_data.get('pct_change', 'N/A')}%)
     EV/EBITDA Multiple: {stock_data.get('ev_ebitda', 'N/A')}
@@ -63,90 +80,149 @@ def generate_bti_report():
     yfinance_news_str = "\n".join([
         f"- **{n['title']}** (Source: {n['publisher']}) - Link: {n['link']}"
         for n in stock_data.get('yfinance_news', [])
-    ])
+    ]) or "(no general market news returned)"
 
-    reg_news_str = "\n".join([
+    catalyst_news_str = "\n".join([
         f"- **{n['title']}** (Source: {n['publisher']}) - Link: {n['link']} - Date: {n['pubDate']}"
-        for n in reg_news
-    ])
-
-    system_instruction = """
-    You are an elite financial analyst and a specialized regulatory intelligence agent for the tobacco and nicotine industry.
-    Your task is to analyze the provided data on British American Tobacco (BTI) and compile a daily email briefing for an investor.
-    
-    Your output MUST be a complete, well-formed HTML document containing inline CSS styles. 
-    Do NOT output any markdown backticks (like ```html), and do not output any introductory or concluding text outside the HTML.
-    
-    Design constraints for the HTML email:
-    - Use clean, premium modern typography (system sans-serif fonts, e.g., 'Segoe UI', Arial, sans-serif).
-    - Color palette: Deep navy background for header (#1A365D), text colors (#1e293b), soft grey backgrounds (#f8fafc), and white content blocks.
-    - Structure:
-        1. A header displaying the report date, stock name, current price, daily percent change, and EV/EBITDA multiple.
-        2. Financial Performance Chart: Include an image referencing `cid:comparison_chart` which displays the 5-day performance of BTI vs Altria & Philip Morris. Give it a nice rounded border, a light grey border, and center it.
-        3. Executive Summary: 2 sentences summarizing the current state.
-        4. Regulatory Analysis: Provide EXACTLY three bullet points under this section. Do NOT write more or fewer.
-            - Bullet 1: Recent FDA regulation changes impacting BTI/nicotine products.
-            - Bullet 2: How the illicit e-cigarette market in the US is responding to regulatory crackdowns.
-            - Bullet 3: Recent regulatory changes/updates impacting BTI *outside* the US (global markets like EU, UK, or Asia).
-        5. Key Market News Feed: Display only the top 2-3 most critical, high-impact news headlines (e.g. from highly trustworthy sources like Reuters, Bloomberg, WSJ, etc.) that are actually causing or likely to cause stock movement. Format them as active clickable hyperlinks.
-        6. A disclaimer footer.
-    """
+        for n in news_items
+    ]) or "(no catalyst news returned)"
 
     prompt = f"""
-    Here is the daily stock and news feed data for BTI on {current_date}:
-    
+    Company data for {display_name} ({ticker}):
+
     === Stock Metrics ===
     {stock_info_str}
-    
+
     === General Market News ===
     {yfinance_news_str}
-    
-    === Global Regulatory & Nicotine News (Google News RSS) ===
-    {reg_news_str}
-    
-    Analyze the data and create the HTML email template. Make sure:
-    - The BTI EV/EBITDA multiple is displayed prominently.
-    - The comparison chart is embedded using `<img src="cid:comparison_chart" ... />` inside the HTML layout.
-    - The regulatory section has EXACTLY three bullet points matching the target topics (FDA changes, US illicit vape crackdown response, and global/ex-US updates).
-    - The news feed is short, containing only the top 2-3 most trustworthy and high-impact headlines with their active links.
-    """
 
-    import time
-    from google.genai.errors import ServerError, APIError
+    === Catalyst / Regulatory / Sector News ===
+    {catalyst_news_str}
+
+    Produce the HTML card for this company following the structure and
+    styling rules exactly.
+    """
 
     max_retries = 3
     retry_delay = 3
     response = None
-    
+
     for attempt in range(max_retries):
         try:
-            print(f"Requesting AI analysis from Gemini (Attempt {attempt + 1}/{max_retries})...")
+            print(f"Requesting AI analysis for {ticker} (Attempt {attempt + 1}/{max_retries})...")
             response = client.models.generate_content(
                 model='gemini-2.5-flash',
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    temperature=0.1, # Keep it highly factual
+                    system_instruction=STOCK_SECTION_SYSTEM_INSTRUCTION,
+                    temperature=0.1,
                 )
             )
             break
         except (ServerError, APIError) as e:
             if attempt == max_retries - 1:
-                print("Failed to contact Gemini after multiple retries due to high server demand.")
+                print(f"Failed to contact Gemini for {ticker} after multiple retries.")
                 raise e
-            print(f"Gemini API experiencing high demand (503). Retrying in {retry_delay} seconds...")
+            print(f"Gemini API experiencing high demand (503) for {ticker}. Retrying in {retry_delay}s...")
             time.sleep(retry_delay)
             retry_delay *= 2
         except Exception as e:
-            # Raise other unexpected errors immediately
             raise e
-    
-    html_content = clean_html_output(response.text)
-    return html_content, stock_data.get('price'), stock_data.get('pct_change')
+
+    return clean_html_output(response.text)
+
+def generate_portfolio_report(tickers=None):
+    """
+    Builds the full multi-stock HTML email:
+      1. Fetches data + tailored catalyst news for each ticker.
+      2. Calls Gemini once per ticker for its analysis card (same depth as
+         the original single-stock report).
+      3. Wraps every card in one consistent, Python-built HTML shell
+         (shared header/chart/footer) so the email reads as one report
+         instead of stitched-together documents.
+
+    A failure on one ticker (data fetch or Gemini call) no longer kills the
+    whole report -- that ticker gets a placeholder card and the rest of the
+    pipeline continues.
+
+    Returns: (full_html, summary) where summary is a list of
+    {"ticker", "price", "pct_change"} dicts, used for the email subject line.
+    """
+    if tickers is None:
+        tickers = list(STOCKS.keys())
+
+    current_date = datetime.datetime.now().strftime("%B %d, %Y")
+    sections_html = []
+    summary = []
+
+    for ticker in tickers:
+        info = STOCKS.get(ticker, {
+            "display_name": ticker,
+            "catalyst_queries": [f"{ticker} stock news regulation"],
+        })
+        try:
+            print(f"Gathering data for {ticker}...")
+            stock_data = data_fetcher.fetch_stock_data(ticker, fallback_name=info["display_name"])
+            if 'error' in stock_data:
+                print(f"Warning: {ticker} stock data fetch had issues: {stock_data['error']}")
+
+            news_items = data_fetcher.fetch_catalyst_news(info["catalyst_queries"])
+
+            section_html = generate_stock_section(ticker, info, stock_data, news_items)
+            sections_html.append(section_html)
+            summary.append({
+                "ticker": ticker,
+                "price": stock_data.get("price"),
+                "pct_change": stock_data.get("pct_change"),
+            })
+        except Exception as e:
+            print(f"Warning: failed to build section for {ticker}, inserting placeholder: {e}")
+            sections_html.append(
+                f'<div style="background-color:#ffffff;border:1px solid #e2e8f0;'
+                f'border-radius:16px;padding:20px;margin-bottom:18px;color:#1e293b;'
+                f'font-family:\'Segoe UI\', Arial, sans-serif;">'
+                f'<strong>{ticker}</strong>: data temporarily unavailable for today\'s report.</div>'
+            )
+            summary.append({"ticker": ticker, "price": None, "pct_change": None})
+
+    header_html = f"""
+    <div style="background-color:#1A365D;color:#ffffff;padding:24px;border-radius:16px 16px 0 0;font-family:'Segoe UI', Arial, sans-serif;">
+        <h1 style="margin:0;font-size:20px;">Daily Portfolio Update</h1>
+        <p style="margin:6px 0 0;font-size:13px;color:#cbd5e1;">{current_date}</p>
+    </div>
+    """
+
+    chart_html = """
+    <div style="background-color:#ffffff;padding:16px;text-align:center;">
+        <img src="cid:comparison_chart" style="max-width:100%;border-radius:12px;border:1px solid #e2e8f0;" />
+    </div>
+    """
+
+    footer_html = """
+    <div style="background-color:#f8fafc;color:#64748b;font-size:11px;padding:16px;border-radius:0 0 16px 16px;text-align:center;font-family:'Segoe UI', Arial, sans-serif;">
+        This report is for informational purposes only and does not constitute investment advice.
+    </div>
+    """
+
+    body = "\n".join(sections_html)
+    full_html = f"""
+    <html>
+    <body style="background-color:#f1f5f9;font-family:'Segoe UI', Arial, sans-serif;margin:0;padding:24px;">
+        <div style="max-width:680px;margin:0 auto;">
+            {header_html}
+            {chart_html}
+            {body}
+            {footer_html}
+        </div>
+    </body>
+    </html>
+    """
+
+    return full_html, summary
 
 if __name__ == "__main__":
     # Test stub
-    report_html, price, change = generate_bti_report()
+    report_html, summary = generate_portfolio_report()
     print("Report generated successfully.")
     output_path = os.path.join(os.path.dirname(__file__), "last_report.html")
     with open(output_path, "w", encoding="utf-8") as f:
