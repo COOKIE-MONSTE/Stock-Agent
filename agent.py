@@ -54,7 +54,7 @@ Visual style (match this exactly so every company's card looks consistent):
 Structure inside the card:
 1. Executive Summary: exactly 2 sentences summarizing the stock's current state.
 2. Key Catalysts & Risks: EXACTLY three bullet points. These should be the three most relevant, market-moving items for THIS SPECIFIC company drawn from the news provided -- they may be regulatory, legal/antitrust, demand or guidance related, competitive, or M&A. Do not force categories that don't fit; choose whichever three are genuinely most relevant based on the supplied data.
-3. Key News: the top 2-3 most critical, highest-impact headlines (prefer trustworthy sources like Reuters, Bloomberg, WSJ) as active clickable hyperlinks.
+3. Key News: the top 2-3 most critical, highest-impact headlines (prefer trustworthy sources like Reuters, Bloomberg, WSJ) as active clickable hyperlinks. Show each headline's publish date next to it (small, muted text, e.g. "Jun 16, 2026") using the date supplied in the data -- never invent a date.
 
 Be factual and concise. Base everything on the data given; never fabricate figures, news, or sources.
 """
@@ -78,7 +78,7 @@ def generate_stock_section(ticker, info, stock_data, news_items):
     """
 
     yfinance_news_str = "\n".join([
-        f"- **{n['title']}** (Source: {n['publisher']}) - Link: {n['link']}"
+        f"- **{n['title']}** (Source: {n['publisher']}, Date: {n['pubDate']}) - Link: {n['link']}"
         for n in stock_data.get('yfinance_news', [])
     ]) or "(no general market news returned)"
 
