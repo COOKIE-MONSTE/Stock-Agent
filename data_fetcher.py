@@ -3,12 +3,37 @@ import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
 import datetime
+from email.utils import parsedate_to_datetime
 import os
 import pandas as pd
 import matplotlib
 # Use the non-interactive Agg backend to avoid GUI window popup issues on Windows/servers
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
+def _format_pub_date(raw):
+    """
+    Normalizes a published-date value into a short, consistent display
+    string like 'Jun 16, 2026'. Handles the formats we actually see:
+      - Google News RSS pubDate (RFC 822, e.g. 'Mon, 16 Jun 2026 14:23:00 GMT')
+      - yfinance's current news format (ISO 8601, e.g. '2026-06-16T14:23:00Z')
+      - yfinance's legacy news format (unix timestamp int)
+    Falls back to a truncated raw string if none of those parse.
+    """
+    if not raw:
+        return "N/A"
+    if isinstance(raw, (int, float)):
+        try:
+            return datetime.datetime.fromtimestamp(raw, tz=datetime.timezone.utc).strftime("%b %d, %Y")
+        except (ValueError, OSError):
+            return "N/A"
+    raw = str(raw)
+    for parse in (parsedate_to_datetime, lambda s: datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))):
+        try:
+            return parse(raw).strftime("%b %d, %Y")
+        except (ValueError, TypeError):
+            continue
+    return raw[:16]
 
 def _get_fx_rate(from_currency, to_currency):
     """
@@ -102,15 +127,24 @@ def fetch_stock_data(ticker, fallback_name=None):
             data['market_cap_bn'] = None
 
         # 3. yfinance stock news (fetch 5, let Gemini pick the top 2-3)
+        # NOTE: current yfinance versions nest article fields under a
+        # 'content' key (title/pubDate/provider/canonicalUrl); older
+        # versions had them flat. We check 'content' first and fall back
+        # to flat keys so this keeps working either way.
         yf_news = []
         raw_news = t.news
         if raw_news:
             for item in raw_news[:5]:
+                content = item.get('content', item)
+                publisher = (content.get('provider') or {}).get('displayName') or content.get('publisher')
+                link = (content.get('canonicalUrl') or {}).get('url') or content.get('link')
+                pub_date_raw = content.get('pubDate') or content.get('providerPublishTime')
+
                 yf_news.append({
-                    'title': item.get('title'),
-                    'publisher': item.get('publisher'),
-                    'link': item.get('link'),
-                    'type': item.get('type')
+                    'title': content.get('title'),
+                    'publisher': publisher,
+                    'link': link,
+                    'pubDate': _format_pub_date(pub_date_raw),
                 })
         data['yfinance_news'] = yf_news
 
@@ -159,7 +193,7 @@ def fetch_catalyst_news(queries, limit=12):
                         "title": clean_title,
                         "publisher": publisher,
                         "link": link,
-                        "pubDate": pub_date_str
+                        "pubDate": _format_pub_date(pub_date_str)
                     })
         except Exception as e:
             print(f"Error fetching RSS news for query '{query}': {e}")
