@@ -1,5 +1,6 @@
 import yfinance as yf
 import urllib.request
+import urllib.parse
 import xml.etree.ElementTree as ET
 import datetime
 import os
@@ -27,22 +28,26 @@ def _get_fx_rate(from_currency, to_currency):
         print(f"Warning: Could not fetch FX rate {from_currency}->{to_currency}: {e}")
         return None
 
-def fetch_bti_data():
+def fetch_stock_data(ticker, fallback_name=None):
     """
-    Fetches BTI stock information, historical prices, and metrics from yfinance.
+    Generic version of the old fetch_bti_data(): fetches price/performance
+    and key valuation metrics for ANY ticker via yfinance. Handles the
+    currency-mismatched EV/EBITDA case generically (returns 1.0 FX rate
+    when listing and financial currency already match, so it's a no-op
+    for USD-only companies like ANF/LYV/CHDN/NCLH/DIS).
     """
     data = {}
     try:
-        ticker = yf.Ticker("BTI")
-        
-        # 1. Fetch current price and performance from history (very reliable)
-        hist = ticker.history(period="5d")
+        t = yf.Ticker(ticker)
+
+        # 1. Price and performance from history (very reliable)
+        hist = t.history(period="5d")
         if not hist.empty:
             current_price = hist['Close'].iloc[-1]
             prev_price = hist['Close'].iloc[-2] if len(hist) > 1 else current_price
             price_change = current_price - prev_price
             pct_change = (price_change / prev_price) * 100
-            
+
             data['price'] = round(current_price, 2)
             data['change'] = round(price_change, 2)
             data['pct_change'] = round(pct_change, 2)
@@ -53,24 +58,20 @@ def fetch_bti_data():
             data['pct_change'] = None
             data['volume'] = None
 
-        # 2. Fetch key metrics
-        info = ticker.info
-        data['name'] = info.get('longName', 'British American Tobacco p.l.c.')
+        # 2. Key metrics
+        info = t.info
+        data['name'] = info.get('longName', fallback_name or ticker)
         data['pe_ratio'] = info.get('trailingPE') or info.get('forwardPE')
-        data['dividend_yield'] = info.get('dividendYield') 
+        data['dividend_yield'] = info.get('dividendYield')
         data['dividend_rate'] = info.get('dividendRate')
         data['market_cap'] = info.get('marketCap')
         data['fifty_two_week_low'] = info.get('fiftyTwoWeekLow')
         data['fifty_two_week_high'] = info.get('fiftyTwoWeekHigh')
-        
-        # EV/EBITDA multiple
-        # NOTE: BTI is a USD-denominated ADR, but British American Tobacco p.l.c.
-        # reports its actual financials in GBP. Yahoo's pre-computed 'enterpriseToEbitda'
-        # mixes the USD-based enterprise value with GBP-denominated EBITDA without
-        # converting currencies first, which distorts the multiple. We recompute it
-        # manually, converting debt/cash/EBITDA into the listing currency first.
-        listing_currency = info.get('currency')              # e.g. 'USD'
-        financial_currency = info.get('financialCurrency')   # e.g. 'GBP'
+
+        # EV/EBITDA multiple, corrected for currency mismatches (no-op for
+        # same-currency tickers since _get_fx_rate returns 1.0 in that case)
+        listing_currency = info.get('currency')
+        financial_currency = info.get('financialCurrency')
         market_cap = info.get('marketCap')
         total_debt = info.get('totalDebt') or 0
         total_cash = info.get('totalCash') or 0
@@ -85,25 +86,24 @@ def fetch_bti_data():
                     enterprise_value = market_cap + (total_debt * fx_rate) - (total_cash * fx_rate)
                     corrected_ev_ebitda = round(enterprise_value / ebitda_converted, 2)
             else:
-                print("Warning: FX rate unavailable; falling back to Yahoo's raw EV/EBITDA (may be currency-mismatched).")
+                print(f"Warning: FX rate unavailable for {ticker}; falling back to Yahoo's raw EV/EBITDA.")
 
-        data['ev_ebitda_yahoo_raw'] = info.get('enterpriseToEbitda')  # kept for comparison/debugging
+        data['ev_ebitda_yahoo_raw'] = info.get('enterpriseToEbitda')
         data['ev_ebitda'] = corrected_ev_ebitda if corrected_ev_ebitda is not None else info.get('enterpriseToEbitda')
-        
-        # Format metrics
+
         if data['dividend_yield']:
             data['dividend_yield_pct'] = round(data['dividend_yield'] * 100, 2)
         else:
             data['dividend_yield_pct'] = None
-            
+
         if data['market_cap']:
             data['market_cap_bn'] = round(data['market_cap'] / 1e9, 2)
         else:
             data['market_cap_bn'] = None
 
-        # 3. Fetch yfinance stock news (we will fetch 5 and let Gemini filter)
+        # 3. yfinance stock news (fetch 5, let Gemini pick the top 2-3)
         yf_news = []
-        raw_news = ticker.news
+        raw_news = t.news
         if raw_news:
             for item in raw_news[:5]:
                 yf_news.append({
@@ -115,42 +115,37 @@ def fetch_bti_data():
         data['yfinance_news'] = yf_news
 
     except Exception as e:
-        print(f"Error fetching yfinance data: {e}")
+        print(f"Error fetching yfinance data for {ticker}: {e}")
         data['error'] = str(e)
-        
+
     return data
 
-def fetch_regulatory_news():
+def fetch_catalyst_news(queries, limit=12):
     """
-    Fetches global tobacco regulatory changes and policy updates using Google News RSS.
-    We target FDA crackdowns, e-cigarette policies, and non-US developments.
+    Generic version of the old fetch_regulatory_news(): runs a list of
+    Google News RSS queries (passed in per-company from stocks_config.py)
+    and returns deduplicated articles.
     """
-    queries = [
-        "tobacco regulation FDA BTI",
-        "illicit e-cigarette crackdown US nicotine",
-        "tobacco excise tax vape ban Europe Asia"
-    ]
-    
     articles = []
     seen_links = set()
-    
+
     for query in queries:
         encoded_query = urllib.parse.quote_plus(query)
         url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-US&gl=US&ceid=US:en"
         req = urllib.request.Request(
-            url, 
+            url,
             headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         )
         try:
             with urllib.request.urlopen(req) as response:
                 xml_data = response.read()
             root = ET.fromstring(xml_data)
-            
-            for item in root.findall(".//item")[:5]: # Limit to 5 per query
+
+            for item in root.findall(".//item")[:5]:  # Limit to 5 per query
                 title = item.find("title").text if item.find("title") is not None else ""
                 link = item.find("link").text if item.find("link") is not None else ""
                 pub_date_str = item.find("pubDate").text if item.find("pubDate") is not None else ""
-                
+
                 if link not in seen_links:
                     seen_links.add(link)
                     clean_title = title
@@ -159,7 +154,7 @@ def fetch_regulatory_news():
                         parts = title.rsplit(" - ", 1)
                         clean_title = parts[0]
                         publisher = parts[1]
-                        
+
                     articles.append({
                         "title": clean_title,
                         "publisher": publisher,
@@ -168,40 +163,37 @@ def fetch_regulatory_news():
                     })
         except Exception as e:
             print(f"Error fetching RSS news for query '{query}': {e}")
-            
-    return articles[:12]
 
-def generate_comparison_chart(output_path):
+    return articles[:limit]
+
+def generate_comparison_chart(output_path, tickers):
     """
-    Generates a 5-day performance chart comparing BTI, Altria (MO), and Philip Morris (PM).
-    Stock performances are normalized to percent change starting from day 1's close.
+    Generates a 5-day normalized (% change) performance chart for an
+    arbitrary group of tickers.
+
+    `tickers` is a dict of {display_label: ticker_symbol}, so it now scales
+    to any number of stocks instead of the old fixed BTI/MO/PM trio.
     """
     print("Generating 5-day stock performance chart...")
-    tickers = {"BTI": "BTI", "Altria (MO)": "MO", "Philip Morris (PM)": "PM"}
 
-    # Fetch each ticker's close prices first. We collect them into one table and
-    # keep only the days where *every* ticker has a price. Plotting each ticker
-    # independently (as before) meant a single missing/NaN day for one ticker
-    # (e.g. PM) would either break its line into two disconnected segments, or
-    # leave it misaligned against the other two on the shared date axis -- both
-    # of which can look like an extra/duplicate line.
+    # Fetch each ticker's close prices first, then keep only the days where
+    # *every* ticker has a price so lines stay aligned on a shared date axis.
     closes_by_label = {}
     for label, ticker_sym in tickers.items():
-        ticker = yf.Ticker(ticker_sym)
-        hist = ticker.history(period="7d")
+        t = yf.Ticker(ticker_sym)
+        hist = t.history(period="7d")
         hist = hist.dropna(subset=['Close'])
         if hist.empty:
             print(f"Warning: No historical data found for {ticker_sym}")
             continue
         series = hist['Close'].copy()
-        series.index = series.index.normalize()  # drop intraday timestamps so dates align across tickers
+        series.index = series.index.normalize()
         closes_by_label[label] = series
 
     if not closes_by_label:
         print("Error: No historical data available for any ticker; skipping chart.")
         return
 
-    # Combine into one table, keep only days shared by all tickers, take the last 5.
     combined = pd.DataFrame(closes_by_label).dropna(how='any')
     combined = combined.tail(5)
 
@@ -209,64 +201,55 @@ def generate_comparison_chart(output_path):
         print("Error: No overlapping trading days found across tickers; skipping chart.")
         return
 
-    plt.figure(figsize=(8, 4))
-    # Set background styling to look premium (soft grey/white)
+    plt.figure(figsize=(9, 5))
     plt.gcf().set_facecolor('#f8fafc')
     ax = plt.axes()
     ax.set_facecolor('#ffffff')
 
-    colors = {"BTI": "#4f46e5", "Altria (MO)": "#f43f5e", "Philip Morris (PM)": "#0d9488"}
-    linestyles = {"BTI": "-", "Altria (MO)": "--", "Philip Morris (PM)": "-."}
-    widths = {"BTI": 2.5, "Altria (MO)": 1.5, "Philip Morris (PM)": 1.5}
+    # Auto-assign distinct colors so this scales to any number of tickers
+    # (the old version hardcoded a color per fixed company name).
+    cmap = plt.get_cmap('tab10')
+    colors = {label: cmap(i % 10) for i, label in enumerate(combined.columns)}
 
-    # Format the dates for x-axis (e.g. '06/12')
     dates = [d.strftime('%m/%d') for d in combined.index]
 
     for label in combined.columns:
         closes = combined[label]
         base_price = closes.iloc[0]
-        # Normalize to percent change starting at 0%
         pct_change = ((closes / base_price) - 1) * 100
 
         plt.plot(dates, pct_change.values,
                  label=label,
                  color=colors[label],
-                 linestyle=linestyles[label],
-                 linewidth=widths[label],
-                 marker='o' if label == "BTI" else None)
-        
-    plt.title("BTI vs. Altria & Philip Morris\n(Last 5 Trading Days Performance)", 
+                 linewidth=2,
+                 marker='o')
+
+    plt.title("Portfolio Group: Last 5 Trading Days Performance",
               fontsize=12, fontweight='bold', color='#1e293b', pad=10)
     plt.xlabel("Date", fontsize=10, color='#64748b')
     plt.ylabel("Performance Change (%)", fontsize=10, color='#64748b')
-    
-    # Format grid lines
+
     plt.grid(True, linestyle=':', alpha=0.6, color='#cbd5e1')
-    
-    # Add a horizontal line at 0% base
     plt.axhline(0, color='#94a3b8', linewidth=0.8, linestyle='-')
-    
-    # Customise legend and borders
-    plt.legend(frameon=True, facecolor='#ffffff', edgecolor='#e2e8f0', loc='best')
+
+    plt.legend(frameon=True, facecolor='#ffffff', edgecolor='#e2e8f0', loc='best', fontsize=8, ncol=2)
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     ax.spines['left'].set_color('#cbd5e1')
     ax.spines['bottom'].set_color('#cbd5e1')
     ax.tick_params(axis='both', colors='#64748b')
-    
-    # Ensure layout fits neatly
+
     plt.tight_layout()
-    
-    # Save image
     plt.savefig(output_path, dpi=150, facecolor=plt.gcf().get_facecolor(), edgecolor='none')
     plt.close()
     print(f"Chart saved successfully to {output_path}")
 
 if __name__ == "__main__":
-    print("Fetching stock metrics...")
-    data = fetch_bti_data()
-    print(f"BTI EV/EBITDA: {data.get('ev_ebitda')}")
-    
-    # Test chart generation
+    from stocks_config import STOCKS
+    print("Fetching stock metrics for all tickers...")
+    for ticker, info in STOCKS.items():
+        data = fetch_stock_data(ticker, info["display_name"])
+        print(f"{ticker} EV/EBITDA: {data.get('ev_ebitda')}")
+
     chart_file = os.path.join(os.path.dirname(__file__), "test_chart.png")
-    generate_comparison_chart(chart_file)
+    generate_comparison_chart(chart_file, {t: t for t in STOCKS})
