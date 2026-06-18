@@ -17,6 +17,7 @@ def send_email(subject, html_content, chart_path=None):
     sender_email = os.getenv("SENDER_EMAIL")
     sender_password = os.getenv("SENDER_PASSWORD")
     recipient_email = os.getenv("RECIPIENT_EMAIL")
+    recipient_list = [r.strip() for r in recipient_email.split(",")] if recipient_email else []
 
     # Validate configuration
     missing_vars = []
@@ -24,7 +25,7 @@ def send_email(subject, html_content, chart_path=None):
     if not smtp_port: missing_vars.append("SMTP_PORT")
     if not sender_email or sender_email == "your_sending_email@gmail.com": missing_vars.append("SENDER_EMAIL")
     if not sender_password or sender_password == "your_email_app_password": missing_vars.append("SENDER_PASSWORD")
-    if not recipient_email or recipient_email == "your_receiving_email@gmail.com": missing_vars.append("RECIPIENT_EMAIL")
+    if not recipient_list or recipient_email == "your_receiving_email@gmail.com": missing_vars.append("RECIPIENT_EMAIL")
 
     if missing_vars:
         print(f"Warning: Email configuration is missing or holds placeholder values: {', '.join(missing_vars)}")
@@ -43,7 +44,7 @@ def send_email(subject, html_content, chart_path=None):
         msg = MIMEMultipart("related")
         msg["Subject"] = subject
         msg["From"] = sender_email
-        msg["To"] = recipient_email
+        msg["To"] = ", ".join(recipient_list)
         
         # Create an alternative subpart for text/html fallback
         msg_alternative = MIMEMultipart("alternative")
@@ -70,7 +71,7 @@ def send_email(subject, html_content, chart_path=None):
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = sender_email
-        msg["To"] = recipient_email
+        msg["To"] = ", ".join(recipient_list)
         
         part_html = MIMEText(html_content, "html")
         msg.attach(part_html)
@@ -81,7 +82,7 @@ def send_email(subject, html_content, chart_path=None):
             print(f"Connecting to SMTP server {smtp_server}:{port} via SSL...")
             with smtplib.SMTP_SSL(smtp_server, port) as server:
                 server.login(sender_email, sender_password)
-                server.sendmail(sender_email, recipient_email, msg.as_string())
+                server.sendmail(sender_email, recipient_list, msg.as_string())
         else:
             print(f"Connecting to SMTP server {smtp_server}:{port} via STARTTLS...")
             with smtplib.SMTP(smtp_server, port) as server:
@@ -89,9 +90,9 @@ def send_email(subject, html_content, chart_path=None):
                 server.starttls()
                 server.ehlo()
                 server.login(sender_email, sender_password)
-                server.sendmail(sender_email, recipient_email, msg.as_string())
+                server.sendmail(sender_email, recipient_list, msg.as_string())
                 
-        print(f"Email sent successfully to {recipient_email}!")
+        print(f"Email sent successfully to {', '.join(recipient_list)}!")
         return True
 
     except Exception as e:
