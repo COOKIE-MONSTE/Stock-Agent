@@ -484,6 +484,82 @@ def fetch_company_news(ticker, catalyst_queries, limit=8,
     return merged[:limit]
 
 
+def fetch_upcoming_earnings(tickers, window_days=14):
+    """
+    Returns a list of upcoming earnings events for the given tickers that fall
+    within the next `window_days` days (default 14), sorted soonest-first.
+
+    Data source: yfinance's Ticker.get_earnings_dates(), which returns a
+    DataFrame indexed by earnings datetime. We keep only dates from today
+    through today+window_days.
+
+    IMPORTANT NUANCE: what Yahoo reports here is the EARNINGS date (the
+    results release), not the 10-Q/10-K filing date. The 10-Q is typically
+    filed a few days to ~2 weeks after earnings. Some dates are also
+    ESTIMATED rather than company-confirmed; yfinance doesn't always expose
+    a clean confirmed/estimated flag, so we conservatively label everything
+    as an expected date in the report copy.
+
+    Each returned dict:
+        {
+          "ticker": "DIS",
+          "display_name": "The Walt Disney Company",
+          "date": datetime.date(2026, 7, 22),
+          "date_str": "Jul 22, 2026",
+          "days_away": 6,
+        }
+
+    Returns [] if nothing falls in the window or on any fetch failure, so the
+    caller can simply skip the section when the list is empty.
+    """
+    from stocks_config import STOCKS  # local import to avoid a cycle at module load
+
+    now = datetime.datetime.now()
+    today = now.date()
+    window_end = today + datetime.timedelta(days=window_days)
+
+    upcoming = []
+    for ticker in tickers:
+        try:
+            t = yf.Ticker(ticker)
+            # limit keeps the call cheap; we only care about the near future.
+            df = t.get_earnings_dates(limit=8)
+            if df is None or df.empty:
+                continue
+
+            for idx in df.index:
+                # idx is a pandas Timestamp (often tz-aware). Normalize to a date.
+                try:
+                    ev_date = idx.date()
+                except AttributeError:
+                    continue
+
+                if today <= ev_date <= window_end:
+                    display_name = STOCKS.get(ticker, {}).get("display_name", ticker)
+                    upcoming.append({
+                        "ticker": ticker,
+                        "display_name": display_name,
+                        "date": ev_date,
+                        "date_str": ev_date.strftime("%b %d, %Y"),
+                        "days_away": (ev_date - today).days,
+                    })
+        except Exception as e:
+            print(f"Warning: could not fetch earnings date for {ticker}: {e}")
+            continue
+
+    # De-dupe (a ticker can occasionally return the same date twice) and sort.
+    seen = set()
+    deduped = []
+    for e in sorted(upcoming, key=lambda x: x["date"]):
+        key = (e["ticker"], e["date"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(e)
+
+    return deduped
+
+
 def generate_comparison_chart(output_path, tickers):
     """
     Generates a 5-day normalized (% change) performance chart for an
