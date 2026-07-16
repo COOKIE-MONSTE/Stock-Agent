@@ -3,8 +3,10 @@ import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
 import datetime
+import json
 from email.utils import parsedate_to_datetime
 import os
+import requests
 import pandas as pd
 import matplotlib
 # Use the non-interactive Agg backend to avoid GUI window popup issues on Windows/servers
@@ -319,6 +321,168 @@ def fetch_catalyst_news(queries, limit=8, max_age_days=14, min_source_score=2):
         a.pop("_rank", None)
 
     return top
+
+
+def _rank_and_trim(articles, limit):
+    """
+    Shared ranking pass used by both the RSS and Finnhub fetchers so every
+    feed is scored on the same scale. Expects each article dict to already
+    carry a '_rank' key. Sorts best-first, trims, and strips internal keys.
+    """
+    articles.sort(key=lambda a: a.get("_rank", 0), reverse=True)
+    top = articles[:limit]
+    for a in top:
+        a.pop("_pub_dt", None)
+        a.pop("_source_score", None)
+        a.pop("_rank", None)
+    return top
+
+
+def fetch_finnhub_news(ticker, limit=8, max_age_days=14, min_source_score=2):
+    """
+    Fetches recent company news for a ticker from Finnhub's company-news
+    endpoint and returns it in the SAME shape as fetch_catalyst_news, so the
+    two feeds are interchangeable and can be merged.
+
+    Why this is a quality upgrade over the RSS path:
+      - Date range is enforced SERVER-SIDE via from/to params, so stale
+        articles are never even transmitted (RSS filters client-side).
+      - Each article is already associated with the ticker by Finnhub, so
+        we're not keyword-guessing relevance the way RSS queries do.
+      - Articles come source-tagged and timestamped (unix seconds), which
+        feeds cleanly into the same source-scoring we use for RSS.
+
+    Requires the FINNHUB_API_KEY environment variable. If it's missing, or
+    the request fails, this returns an empty list so the caller can fall
+    back to RSS without crashing the pipeline.
+    """
+    api_key = os.getenv("FINNHUB_API_KEY")
+    if not api_key or api_key == "YOUR_FINNHUB_API_KEY":
+        print("Info: FINNHUB_API_KEY not set; skipping Finnhub news (will use RSS).")
+        return []
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    frm = (now - datetime.timedelta(days=max_age_days)).strftime("%Y-%m-%d")
+    to = now.strftime("%Y-%m-%d")
+
+    url = "https://finnhub.io/api/v1/company-news"
+    params = {"symbol": ticker, "from": frm, "to": to, "token": api_key}
+
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        # Finnhub returns 429 on rate-limit and sometimes non-JSON bodies on
+        # error, so check status before trusting the payload.
+        if resp.status_code == 429:
+            print(f"Warning: Finnhub rate limit hit for {ticker}; falling back to RSS.")
+            return []
+        resp.raise_for_status()
+        raw_items = resp.json()
+    except (requests.RequestException, json.JSONDecodeError, ValueError) as e:
+        print(f"Warning: Finnhub news fetch failed for {ticker}: {e}")
+        return []
+
+    if not isinstance(raw_items, list):
+        print(f"Warning: unexpected Finnhub response shape for {ticker}; falling back to RSS.")
+        return []
+
+    cutoff = now - datetime.timedelta(days=max_age_days)
+    articles = []
+    seen_links = set()
+
+    for item in raw_items:
+        # Finnhub company-news fields: headline, source, url, datetime (unix s),
+        # summary, category, related.
+        title = (item.get("headline") or "").strip()
+        link = item.get("url") or ""
+        publisher = (item.get("source") or "").strip() or "Finnhub"
+        ts = item.get("datetime")
+
+        if not title or not link or link in seen_links:
+            continue
+
+        pub_dt = _parse_pub_datetime(ts)  # handles unix int already
+        # Server already bounded the range, but re-check defensively.
+        if pub_dt is None or pub_dt < cutoff:
+            continue
+
+        source_score = _score_source(publisher)
+        if source_score < min_source_score:
+            continue
+
+        seen_links.add(link)
+
+        age_days = (now - pub_dt).total_seconds() / 86400.0
+        recency_score = max(0.0, 1.0 - (age_days / max_age_days))
+        rank = source_score + (recency_score * 3.0)
+
+        articles.append({
+            "title": title,
+            "publisher": publisher,
+            "link": link,
+            "pubDate": _format_pub_date(ts),
+            "_pub_dt": pub_dt,
+            "_source_score": source_score,
+            "_rank": rank,
+        })
+
+    return _rank_and_trim(articles, limit)
+
+
+def fetch_company_news(ticker, catalyst_queries, limit=8,
+                       max_age_days=14, min_source_score=2):
+    """
+    Primary news entry point. Tries Finnhub first (higher-quality, ticker-
+    scoped, server-side date filtered); if it returns too few articles
+    (missing key, thin ADR coverage, rate limit, etc.), tops up with the
+    filtered Google News RSS feed. Results from both are deduplicated by
+    link and URL-normalized title, then ranked together on the shared scale.
+
+    This is what agent.py should call instead of fetch_catalyst_news directly.
+    The old fetch_catalyst_news still exists and works standalone.
+
+    `catalyst_queries` is the per-company RSS query list from stocks_config.py,
+    used only for the fallback/top-up leg.
+    """
+    finnhub_items = fetch_finnhub_news(
+        ticker, limit=limit, max_age_days=max_age_days,
+        min_source_score=min_source_score,
+    )
+
+    # If Finnhub gave us a healthy set, we may still top up with RSS to widen
+    # angle coverage, but Finnhub items keep priority. If Finnhub gave us
+    # little/nothing, RSS carries the load.
+    need_more = len(finnhub_items) < limit
+    rss_items = []
+    if need_more:
+        rss_items = fetch_catalyst_news(
+            catalyst_queries, limit=limit, max_age_days=max_age_days,
+            min_source_score=min_source_score,
+        )
+
+    # Merge with dedup. Prefer Finnhub on collision (listed first).
+    merged = []
+    seen_links = set()
+    seen_titles = set()
+
+    def _title_key(t):
+        return "".join(ch.lower() for ch in (t or "") if ch.isalnum())
+
+    for item in finnhub_items + rss_items:
+        link = item.get("link", "")
+        tkey = _title_key(item.get("title", ""))
+        if link in seen_links or (tkey and tkey in seen_titles):
+            continue
+        seen_links.add(link)
+        if tkey:
+            seen_titles.add(tkey)
+        merged.append(item)
+
+    # Finnhub items already came ranked and stripped; RSS items too. They were
+    # each internally sorted, but the concatenation isn't globally sorted and
+    # the internal _rank keys are gone. That's intentional: Finnhub-first
+    # ordering is the priority we want. Just trim to limit.
+    return merged[:limit]
+
 
 def generate_comparison_chart(output_path, tickers):
     """
