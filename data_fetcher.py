@@ -35,6 +35,67 @@ def _format_pub_date(raw):
             continue
     return raw[:16]
 
+def _parse_pub_datetime(raw):
+    """
+    Like _format_pub_date, but returns an actual timezone-aware datetime
+    (or None) so callers can filter by recency. _format_pub_date is still
+    used for the final display string; this is the machine-readable version.
+    """
+    if not raw:
+        return None
+    if isinstance(raw, (int, float)):
+        try:
+            return datetime.datetime.fromtimestamp(raw, tz=datetime.timezone.utc)
+        except (ValueError, OSError):
+            return None
+    raw = str(raw)
+    for parse in (parsedate_to_datetime,
+                  lambda s: datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))):
+        try:
+            dt = parse(raw)
+            # Normalize naive datetimes to UTC so comparisons never crash.
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            return dt
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+# Source-quality tiers. Higher score = more trustworthy / less spammy.
+# Matched case-insensitively as substrings against the publisher string that
+# Google News appends to each headline (e.g. "... - Reuters"). Anything not
+# listed gets NEUTRAL_SOURCE_SCORE. Add/adjust names freely as you spot
+# offenders in real output.
+SOURCE_SCORES = {
+    # Tier 1: primary financial news wires / papers of record
+    "reuters": 10, "bloomberg": 10, "wall street journal": 10, "wsj": 10,
+    "financial times": 10, "ft.com": 10, "the associated press": 9, "ap news": 9,
+    # Tier 2: solid business press
+    "cnbc": 7, "barron": 7, "marketwatch": 6, "forbes": 6, "the economist": 8,
+    "business insider": 5, "yahoo finance": 5, "investor's business daily": 6,
+    "seeking alpha": 4, "benzinga": 4,
+    # Company primary sources (press releases / IR wires) — high signal, low spin
+    "business wire": 8, "globe newswire": 8, "pr newswire": 8,
+    # Tier 3: known aggregators / content mills — actively downweighted
+    "insider monkey": 1, "simply wall st": 1, "zacks": 2, "the motley fool": 2,
+    "motley fool": 2, "tipranks": 2, "gurufocus": 2, "stocktwits": 1,
+    "24/7 wall st": 1, "invezz": 1, "247wallst": 1,
+}
+NEUTRAL_SOURCE_SCORE = 3
+
+
+def _score_source(publisher):
+    """Return a quality score for a publisher name (case-insensitive substring match)."""
+    if not publisher:
+        return NEUTRAL_SOURCE_SCORE
+    p = publisher.lower()
+    for name, score in SOURCE_SCORES.items():
+        if name in p:
+            return score
+    return NEUTRAL_SOURCE_SCORE
+
+
 def _get_fx_rate(from_currency, to_currency):
     """
     Fetches a spot FX rate to convert an amount in `from_currency` into `to_currency`,
@@ -154,14 +215,32 @@ def fetch_stock_data(ticker, fallback_name=None):
 
     return data
 
-def fetch_catalyst_news(queries, limit=12):
+def fetch_catalyst_news(queries, limit=8, max_age_days=14, min_source_score=2):
     """
-    Generic version of the old fetch_regulatory_news(): runs a list of
-    Google News RSS queries (passed in per-company from stocks_config.py)
-    and returns deduplicated articles.
+    Runs a list of Google News RSS queries (passed in per-company from
+    stocks_config.py) and returns deduplicated articles that are BOTH
+    recent and from a decent source, ranked best-first.
+
+    Filtering/ranking applied before returning:
+      - Date filter: articles older than `max_age_days` (or undated) are dropped.
+      - Source floor: articles from sources scoring below `min_source_score`
+        are dropped (content mills like insidermonkey/simplywall.st).
+      - Ranking: remaining articles sorted by source quality, with recency
+        as a tie-breaker, then trimmed to `limit`.
+
+    Tunables:
+      - max_age_days=14 : two-week window. Drop to 7 for a stricter brief.
+      - min_source_score=2 : drops only the worst tier. Raise to 4-5 to keep
+        essentially wires + major business press only.
+      - limit=8 : Gemini still picks the top 2-3 for display, but a cleaner
+        candidate pool means better picks.
     """
     articles = []
     seen_links = set()
+
+    # Hard recency cutoff: anything older than this never reaches Gemini.
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cutoff = now - datetime.timedelta(days=max_age_days)
 
     for query in queries:
         encoded_query = urllib.parse.quote_plus(query)
@@ -175,30 +254,71 @@ def fetch_catalyst_news(queries, limit=12):
                 xml_data = response.read()
             root = ET.fromstring(xml_data)
 
-            for item in root.findall(".//item")[:5]:  # Limit to 5 per query
+            # Pull more per query than before (10 vs 5): filtering + ranking
+            # downstream means we can afford a wider net and still end up
+            # with a cleaner final set.
+            for item in root.findall(".//item")[:10]:
                 title = item.find("title").text if item.find("title") is not None else ""
                 link = item.find("link").text if item.find("link") is not None else ""
                 pub_date_str = item.find("pubDate").text if item.find("pubDate") is not None else ""
 
-                if link not in seen_links:
-                    seen_links.add(link)
-                    clean_title = title
-                    publisher = "Google News"
-                    if " - " in title:
-                        parts = title.rsplit(" - ", 1)
-                        clean_title = parts[0]
-                        publisher = parts[1]
+                if not link or link in seen_links:
+                    continue
 
-                    articles.append({
-                        "title": clean_title,
-                        "publisher": publisher,
-                        "link": link,
-                        "pubDate": _format_pub_date(pub_date_str)
-                    })
+                pub_dt = _parse_pub_datetime(pub_date_str)
+
+                # Date filter: drop undated or stale articles outright.
+                # (Undated is dropped too — if we can't verify recency we
+                # don't want a possibly-months-old article in a daily brief.)
+                if pub_dt is None or pub_dt < cutoff:
+                    continue
+
+                seen_links.add(link)
+                clean_title = title
+                publisher = "Google News"
+                if " - " in title:
+                    parts = title.rsplit(" - ", 1)
+                    clean_title = parts[0]
+                    publisher = parts[1]
+
+                source_score = _score_source(publisher)
+
+                # Drop the worst-tier content mills entirely rather than
+                # just downweighting them, if a floor is set.
+                if source_score < min_source_score:
+                    continue
+
+                # Recency score: newer = higher, on a 0..1 scale across the window.
+                age_days = (now - pub_dt).total_seconds() / 86400.0
+                recency_score = max(0.0, 1.0 - (age_days / max_age_days))
+
+                # Combined rank: source quality dominates, recency breaks ties.
+                # (source_score is ~1..10; recency adds up to ~3.)
+                rank = source_score + (recency_score * 3.0)
+
+                articles.append({
+                    "title": clean_title,
+                    "publisher": publisher,
+                    "link": link,
+                    "pubDate": _format_pub_date(pub_date_str),
+                    "_pub_dt": pub_dt,
+                    "_source_score": source_score,
+                    "_rank": rank,
+                })
         except Exception as e:
             print(f"Error fetching RSS news for query '{query}': {e}")
 
-    return articles[:limit]
+    # Rank best-first, then trim to the limit.
+    articles.sort(key=lambda a: a["_rank"], reverse=True)
+    top = articles[:limit]
+
+    # Strip internal scoring keys so the payload handed to Gemini stays clean.
+    for a in top:
+        a.pop("_pub_dt", None)
+        a.pop("_source_score", None)
+        a.pop("_rank", None)
+
+    return top
 
 def generate_comparison_chart(output_path, tickers):
     """
