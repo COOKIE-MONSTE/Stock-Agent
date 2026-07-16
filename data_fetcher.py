@@ -560,6 +560,132 @@ def fetch_upcoming_earnings(tickers, window_days=14):
     return deduped
 
 
+# FRED (Federal Reserve Economic Data) series we track for the consumer/retail
+# macro section. These are the authoritative primary sources: U.S. Census
+# Bureau (retail sales) and University of Michigan (sentiment), served via the
+# St. Louis Fed. Each entry: series_id -> (human label, units hint, notes).
+FRED_SERIES = {
+    "MRTSMPCSM44000USS": ("Retail Trade sales, MoM % change", "%", ""),
+    "RSXFS": ("Advance Retail Sales (ex-food services)", "$M SA", "timeliest print; advance estimate"),
+    "UMCSENT": ("U. Michigan Consumer Sentiment", "index 1966Q1=100",
+                "released by UMich; FRED copy delayed ~1 month at source's request"),
+    "PCEC96": ("Real Personal Consumption Expenditures", "$B chained", ""),
+}
+
+
+def fetch_fred_indicators(series=None, per_series_points=3):
+    """
+    Fetches the most recent observations for a set of FRED economic series,
+    for the consumer/retail macro section. Returns ONLY authoritative data
+    straight from the St. Louis Fed's API (sources: U.S. Census Bureau and
+    University of Michigan). Nothing here is model-generated.
+
+    Requires FRED_API_KEY (free from https://fred.stlouisfed.org/docs/api/api_key.html).
+    If the key is missing or any call fails, returns {} so the caller can build
+    the macro section WITHOUT hard numbers rather than crashing or inventing them.
+
+    Returns a dict:
+        {
+          "UMCSENT": {
+            "label": "U. Michigan Consumer Sentiment",
+            "units": "index 1966Q1=100",
+            "notes": "...delayed ~1 month...",
+            "latest": {"date": "2026-06-01", "value": 60.7},
+            "prior": {"date": "2026-05-01", "value": 52.2},
+            "change": 8.5,            # latest - prior (absolute)
+            "recent": [ {date,value}, ... ]  # newest-first, per_series_points long
+          },
+          ...
+        }
+    """
+    api_key = os.getenv("FRED_API_KEY")
+    if not api_key or api_key == "YOUR_FRED_API_KEY":
+        print("Info: FRED_API_KEY not set; macro section will omit hard economic figures.")
+        return {}
+
+    series = series or FRED_SERIES
+    out = {}
+
+    for series_id, meta in series.items():
+        label, units, notes = meta
+        url = "https://api.stlouisfed.org/fred/series/observations"
+        params = {
+            "series_id": series_id,
+            "api_key": api_key,
+            "file_type": "json",
+            "sort_order": "desc",       # newest first
+            "limit": max(per_series_points, 2),
+        }
+        try:
+            resp = requests.get(url, params=params, timeout=15)
+            resp.raise_for_status()
+            payload = resp.json()
+        except (requests.RequestException, json.JSONDecodeError, ValueError) as e:
+            print(f"Warning: FRED fetch failed for {series_id}: {e}")
+            continue
+
+        obs = payload.get("observations", [])
+        # FRED uses "." for missing values; filter those out.
+        clean = []
+        for o in obs:
+            v = o.get("value")
+            if v in (None, ".", ""):
+                continue
+            try:
+                clean.append({"date": o.get("date"), "value": float(v)})
+            except ValueError:
+                continue
+
+        if not clean:
+            continue
+
+        entry = {
+            "label": label,
+            "units": units,
+            "notes": notes,
+            "latest": clean[0],
+            "recent": clean[:per_series_points],
+        }
+        if len(clean) > 1:
+            entry["prior"] = clean[1]
+            entry["change"] = round(clean[0]["value"] - clean[1]["value"], 2)
+        out[series_id] = entry
+
+    return out
+
+
+# Retail bellwethers and macro-consumer queries for the sector section. These
+# feed the SAME filtered/scored news pipeline (fetch_company_news) so the macro
+# analysis is grounded in recent, reputable, dated articles -- not model memory.
+RETAIL_MACRO_QUERIES = [
+    "Walmart earnings consumer outlook guidance",
+    "Target Costco consumer spending results",
+    "Amazon retail consumer demand outlook",
+    "US consumer spending retail sales report",
+    "consumer sentiment inflation spending shift",
+    "private label store brand trade down consumer",
+    "retailer pricing strategy discount promotion margins",
+]
+
+
+def fetch_retail_macro_news(limit=14, max_age_days=14, min_source_score=3):
+    """
+    Gathers recent, source-scored news for the consumer/retail macro section
+    using the existing news pipeline. Uses a HIGHER source floor (min_source_score=3)
+    than the per-stock feed, because macro claims should lean on quality outlets.
+
+    Reuses fetch_catalyst_news (the filtered/ranked RSS path) across the
+    RETAIL_MACRO_QUERIES set. Finnhub is company-scoped, so RSS is the right
+    tool for these thematic/macro queries.
+    """
+    return fetch_catalyst_news(
+        RETAIL_MACRO_QUERIES,
+        limit=limit,
+        max_age_days=max_age_days,
+        min_source_score=min_source_score,
+    )
+
+
 def generate_comparison_chart(output_path, tickers):
     """
     Generates a 5-day normalized (% change) performance chart for an
