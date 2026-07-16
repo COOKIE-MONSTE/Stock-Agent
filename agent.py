@@ -85,7 +85,10 @@ Card shell: white background, 16px border-radius, 1px solid #e2e8f0 border,
 20px padding, 18px bottom margin, font-family 'Segoe UI', Arial, sans-serif.
 Header row: company name + ticker in bold #1A365D; current price and daily %
 change on the same row (green #16a34a if positive, red #dc2626 if negative);
-EV/EBITDA multiple. Keep the header compact and consistent.
+EV/EBITDA multiple. Keep the header compact and consistent. Use the brand
+crimson #900018 as a subtle accent -- e.g. for the small section labels
+("What moved the stock", "Drivers & risks", "Key news") -- so cards match the
+report's brand styling.
 
 Inside the card, in this order:
 1. "What moved the stock" -- 2-4 sentences of causal analysis per the CORE TASK
@@ -228,7 +231,7 @@ def build_earnings_section(events, window_days=14):
 
     return f"""
     <div style="background-color:#ffffff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin-bottom:18px;font-family:'Segoe UI', Arial, sans-serif;">
-        <h2 style="margin:0 0 4px;font-size:16px;color:#1A365D;">📅 Upcoming Earnings (next {window_days} days)</h2>
+        <h2 style="margin:0 0 4px;font-size:16px;color:#900018;">📅 Upcoming Earnings (next {window_days} days)</h2>
         <p style="margin:0 0 12px;font-size:12px;color:#64748b;">
             {len(events)} portfolio {plural} scheduled. Dates are expected earnings-release dates;
             the related 10-Q/10-K is typically filed shortly after and some dates may still be estimates.
@@ -296,13 +299,14 @@ A single self-contained HTML fragment: one <div>...</div>, inline CSS only, no
 
 Card shell: white background, 16px border-radius, 1px solid #e2e8f0 border,
 20px padding, 18px bottom margin, font-family 'Segoe UI', Arial, sans-serif.
-Open with a header: <h2 style="margin:0 0 12px;font-size:17px;color:#1A365D;">
-Consumer & Retail: Macro & Sector Read</h2>
+Open with a header: <h2 style="margin:0 0 12px;font-size:17px;color:#900018;">
+Consumer &amp; Retail: Macro &amp; Sector Read</h2>
 
-Use clear <h3> subheadings (color #334155, font-size 14px), concise paragraphs,
+Use clear <h3> subheadings (color #1A365D, font-size 14px), concise paragraphs,
 and <ul> bullets for specifics. Where you cite a FRED figure, present it as a
-small data callout (e.g. a <div> with a light #f1f5f9 background). Keep it
-skimmable and professional. Depth and evidential grounding beat length.
+small data callout (e.g. a <div> with a light #f1f5f9 background and a left
+border in brand crimson #900018). Keep it skimmable and professional. Depth and
+evidential grounding beat length.
 """
 
 
@@ -448,14 +452,16 @@ def generate_portfolio_report(tickers=None):
             summary.append({"ticker": ticker, "price": None, "pct_change": None})
 
     header_html = f"""
-    <div style="background-color:#1A365D;color:#ffffff;padding:24px;border-radius:16px 16px 0 0;font-family:'Segoe UI', Arial, sans-serif;">
-        <h1 style="margin:0;font-size:20px;">Daily Portfolio Update</h1>
-        <p style="margin:6px 0 0;font-size:13px;color:#cbd5e1;">{current_date}</p>
+    <div style="background-color:#ffffff;padding:24px 24px 18px;border-radius:16px 16px 0 0;border-bottom:3px solid #900018;font-family:'Segoe UI', Arial, sans-serif;text-align:center;">
+        <img src="cid:brand_logo" alt="CMC SIF Consumer" style="max-width:340px;width:70%;height:auto;display:block;margin:0 auto 14px;" />
+        <div style="font-size:15px;font-weight:600;color:#1A365D;letter-spacing:0.3px;">Daily Portfolio Update</div>
+        <div style="font-size:12px;color:#64748b;margin-top:3px;">{current_date}</div>
     </div>
     """
 
     chart_html = """
-    <div style="background-color:#ffffff;padding:16px;text-align:center;">
+    <div style="background-color:#ffffff;padding:20px 16px 4px;text-align:center;">
+        <div style="font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#900018;margin-bottom:10px;">Portfolio Performance</div>
         <img src="cid:comparison_chart" style="max-width:100%;border-radius:12px;border:1px solid #e2e8f0;" />
     </div>
     """
@@ -490,21 +496,26 @@ def generate_portfolio_report(tickers=None):
         macro_html = ""
 
     footer_html = """
-    <div style="background-color:#f8fafc;color:#64748b;font-size:11px;padding:16px;border-radius:0 0 16px 16px;text-align:center;font-family:'Segoe UI', Arial, sans-serif;">
-        This report is for informational purposes only and does not constitute investment advice.
+    <div style="background-color:#1A365D;color:#cbd5e1;font-size:11px;line-height:1.6;padding:18px 20px;border-radius:0 0 16px 16px;text-align:center;font-family:'Segoe UI', Arial, sans-serif;">
+        <div style="color:#ffffff;font-weight:600;letter-spacing:0.5px;margin-bottom:4px;">CMC SIF &middot; Consumer</div>
+        This report is for informational and educational purposes only and does not constitute investment advice.
     </div>
     """
 
     body = "\n".join(sections_html)
     full_html = f"""
     <html>
-    <body style="background-color:#f1f5f9;font-family:'Segoe UI', Arial, sans-serif;margin:0;padding:24px;">
-        <div style="max-width:680px;margin:0 auto;">
+    <body style="background-color:#eef1f5;font-family:'Segoe UI', Arial, sans-serif;margin:0;padding:24px 16px;">
+        <div style="max-width:680px;margin:0 auto;border-radius:16px;overflow:hidden;box-shadow:0 1px 3px rgba(15,23,42,0.08);">
             {header_html}
-            {chart_html}
-            {earnings_html}
-            {body}
-            {macro_html}
+            <div style="background-color:#ffffff;padding:0 16px;">
+                {chart_html}
+            </div>
+            <div style="padding:0 16px;background-color:#eef1f5;">
+                {earnings_html}
+                {body}
+                {macro_html}
+            </div>
             {footer_html}
         </div>
     </body>
