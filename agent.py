@@ -11,6 +11,12 @@ from stocks_config import STOCKS
 # Load configuration
 load_dotenv()
 
+# Model selection. gemini-3.5-flash is the current-generation Flash model
+# (free tier, far higher daily quota than the old 2.5-flash 20/day limit) and
+# is well-suited to this synthesis/analysis task. Override via env if desired.
+# If Google ever retires this string, swap it here in one place.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+
 def get_gemini_client():
     """
     Initializes and returns the Google GenAI Client.
@@ -40,23 +46,63 @@ def clean_html_output(text):
 # still steer the *kind* of news each company gets, so quality/relevance is
 # preserved even though the prompt itself is generic.
 STOCK_SECTION_SYSTEM_INSTRUCTION = """
-You are an elite equity analyst producing one section of a daily multi-stock
-investor briefing email. You will be given data for ONE company at a time.
+You are a senior equity analyst writing one company's section of a daily
+investor briefing. Your job is NOT to summarize headlines -- it is to explain
+WHY the stock is doing what it's doing today, connecting price action to
+concrete, verifiable drivers.
 
-Your output MUST be a single self-contained HTML fragment (a <div>...</div>)
-with inline CSS styles only. Do NOT include <html>, <head>, or <body> tags,
-and do not output markdown backticks or any text outside the <div>.
+=== YOUR CORE TASK ===
+For the company you're given, the single most important thing you produce is a
+causal explanation of today's price move. Ask yourself, in order:
+1. Is today's move explained by a COMPANY-SPECIFIC event in the data
+   (earnings, guidance, an analyst action, a regulatory/legal development,
+   M&A, a product or operational event)?
+2. If not, is it explained by a MACRO or SECTOR force (rates, oil, consumer-
+   spending data, a sector-wide move, geopolitics) that would push peers the
+   same way?
+3. If NEITHER the company news nor a plausible macro/sector driver in the data
+   explains the move, SAY SO PLAINLY -- e.g. "Today's 2% gain has no clear
+   catalyst in the available data and appears to be noise or drift." Do not
+   invent a narrative to fill the gap. Admitting "no clear catalyst" is a
+   correct, valuable answer and is strongly preferred over manufactured
+   causation.
 
-Visual style (match this exactly so every company's card looks consistent):
-- White card, 16px border-radius, 1px solid #e2e8f0 border, 20px padding, 18px bottom margin, font-family 'Segoe UI', Arial, sans-serif.
-- Header row inside the card: company name + ticker in bold #1A365D, with current price, daily % change (use #16a34a for positive, #dc2626 for negative), and EV/EBITDA multiple shown on the same line or right-aligned.
+Be specific and evidential. Tie claims to the dated items you were given.
+"The stock rose 4.4%, its context supported by X (Reuters, Jul 14)" is good;
+"the stock rose on positive sentiment" is a failure. Never fabricate figures,
+events, dates, or sources; use only what's in the supplied data.
 
-Structure inside the card:
-1. Executive Summary: exactly 2 sentences summarizing the stock's current state.
-2. Key Catalysts & Risks: EXACTLY three bullet points. These should be the three most relevant, market-moving items for THIS SPECIFIC company drawn from the news provided -- they may be regulatory, legal/antitrust, demand or guidance related, competitive, or M&A. Do not force categories that don't fit; choose whichever three are genuinely most relevant based on the supplied data.
-3. Key News: the top 2-3 most critical, highest-impact headlines (prefer trustworthy sources like Reuters, Bloomberg, WSJ) as active clickable hyperlinks. Show each headline's publish date next to it (small, muted text, e.g. "Jun 16, 2026") using the date supplied in the data -- never invent a date.
+Distinguish clearly between what you KNOW (it's in the data) and what you're
+INFERRING (a plausible link). Hedge inferences honestly ("this likely
+reflects...", "consistent with...") rather than asserting them as fact.
 
-Be factual and concise. Base everything on the data given; never fabricate figures, news, or sources.
+=== OUTPUT FORMAT ===
+Output a single self-contained HTML fragment (one <div>...</div>) with inline
+CSS only. No <html>/<head>/<body> tags, no markdown backticks, no text outside
+the div. Use <strong> for emphasis, never markdown asterisks.
+
+Card shell: white background, 16px border-radius, 1px solid #e2e8f0 border,
+20px padding, 18px bottom margin, font-family 'Segoe UI', Arial, sans-serif.
+Header row: company name + ticker in bold #1A365D; current price and daily %
+change on the same row (green #16a34a if positive, red #dc2626 if negative);
+EV/EBITDA multiple. Keep the header compact and consistent.
+
+Inside the card, in this order:
+1. "What moved the stock" -- 2-4 sentences of causal analysis per the CORE TASK
+   above. This is the heart of the card; give it the most depth. It is fine for
+   this section to be longer for a stock with a real catalyst and shorter for
+   one that's just drifting.
+2. "Drivers & risks" -- the genuinely material catalysts and risks, as a short
+   bullet list. Include ONLY items that clear a materiality bar (could plausibly
+   move the stock). Prefer two strong points over three padded ones; you may
+   give anywhere from one to four. Do NOT pad to hit a number. Where useful,
+   label each as a near-term catalyst vs. a standing risk.
+3. "Key news" -- the 2-3 highest-impact headlines as clickable <a> links,
+   preferring reputable sources, each with its supplied publish date in small
+   muted text. Never invent a date; use only dates provided.
+
+Depth and honesty matter more than uniformity across cards. A shorter, sharper,
+correctly-hedged card beats a longer padded one.
 """
 
 def generate_stock_section(ticker, info, stock_data, news_items):
@@ -68,22 +114,37 @@ def generate_stock_section(ticker, info, stock_data, news_items):
     client = get_gemini_client()
     display_name = info.get("display_name", ticker)
 
+    # Frame the move explicitly so the model reasons about direction/magnitude
+    # rather than restating the number. Compute a plain-language descriptor.
+    pct = stock_data.get('pct_change')
+    if isinstance(pct, (int, float)):
+        direction = "up" if pct > 0 else "down" if pct < 0 else "flat"
+        magnitude = ("a large" if abs(pct) >= 4 else
+                     "a moderate" if abs(pct) >= 1.5 else
+                     "a small" if abs(pct) > 0 else "essentially no")
+        move_str = f"The stock is {direction} {pct}% today ({magnitude} move)."
+    else:
+        move_str = "Today's move is unavailable."
+
     stock_info_str = f"""
     Ticker: {ticker} ({display_name})
     Current Price: ${stock_data.get('price', 'N/A')}
     Daily Change: ${stock_data.get('change', 'N/A')} ({stock_data.get('pct_change', 'N/A')}%)
+    {move_str}
+    52-Week Range: ${stock_data.get('fifty_two_week_low', 'N/A')} - ${stock_data.get('fifty_two_week_high', 'N/A')}
+    Volume (today): {stock_data.get('volume', 'N/A')}
     EV/EBITDA Multiple: {stock_data.get('ev_ebitda', 'N/A')}
     Dividend Yield: {stock_data.get('dividend_yield_pct', 'N/A')}%
     Market Cap: {stock_data.get('market_cap_bn', 'N/A')} Billion USD
     """
 
     yfinance_news_str = "\n".join([
-        f"- **{n['title']}** (Source: {n['publisher']}, Date: {n['pubDate']}) - Link: {n['link']}"
+        f"- {n['title']} (Source: {n['publisher']}, Date: {n['pubDate']}) - Link: {n['link']}"
         for n in stock_data.get('yfinance_news', [])
     ]) or "(no general market news returned)"
 
     catalyst_news_str = "\n".join([
-        f"- **{n['title']}** (Source: {n['publisher']}) - Link: {n['link']} - Date: {n['pubDate']}"
+        f"- {n['title']} (Source: {n['publisher']}, Date: {n['pubDate']}) - Link: {n['link']}"
         for n in news_items
     ]) or "(no catalyst news returned)"
 
@@ -99,8 +160,13 @@ def generate_stock_section(ticker, info, stock_data, news_items):
     === Catalyst / Regulatory / Sector News ===
     {catalyst_news_str}
 
-    Produce the HTML card for this company following the structure and
-    styling rules exactly.
+    Write this company's briefing card. Lead with your causal explanation of
+    today's move: identify the most likely driver (company-specific first, then
+    macro/sector), tie it to specific dated items above, and clearly flag when a
+    link is an inference rather than a stated fact. If nothing in the data
+    explains the move, say so directly rather than inventing a reason. Then give
+    the material drivers/risks and the key news links, following the format
+    rules. Prioritize analytical depth and honesty over matching other cards.
     """
 
     max_retries = 3
@@ -111,11 +177,11 @@ def generate_stock_section(ticker, info, stock_data, news_items):
         try:
             print(f"Requesting AI analysis for {ticker} (Attempt {attempt + 1}/{max_retries})...")
             response = client.models.generate_content(
-                model='gemini-2.5-flash',
+                model=GEMINI_MODEL,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     system_instruction=STOCK_SECTION_SYSTEM_INSTRUCTION,
-                    temperature=0.1,
+                    temperature=0.5,
                 )
             )
             break
