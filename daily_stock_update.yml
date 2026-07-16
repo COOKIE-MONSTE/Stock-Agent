@@ -3,7 +3,6 @@ name: Daily BTI Stock Update
 on:
   schedule:
     # Run daily at 14:00 UTC (which is 8:00 AM your local time, UTC-6)
-    # Note: GitHub Actions schedule triggers can sometimes be delayed by a few minutes
     - cron: '0 14 * * *'
   workflow_dispatch: # Enables manual run trigger via the GitHub web interface
 
@@ -27,8 +26,8 @@ jobs:
 
     - name: Run BTI Stock Update Agent
       env:
-        # Load credentials securely from GitHub Actions Secrets
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
         SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
         SMTP_PORT: ${{ secrets.SMTP_PORT }}
         SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
