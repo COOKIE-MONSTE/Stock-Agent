@@ -197,6 +197,57 @@ def generate_stock_section(ticker, info, stock_data, news_items):
 
     return clean_html_output(response.text)
 
+def build_earnings_section(events, window_days=14):
+    """
+    Renders the 'Upcoming Earnings' HTML block from a list of events
+    (as returned by data_fetcher.fetch_upcoming_earnings).
+
+    Returns an EMPTY STRING when there are no events, so the caller can
+    concatenate unconditionally and the section simply vanishes from the
+    email when nothing is scheduled in the window. This is deterministic
+    Python-built HTML -- no Gemini call -- so it costs no quota and can't
+    hallucinate a date.
+    """
+    if not events:
+        return ""
+
+    rows = []
+    for e in events:
+        days = e["days_away"]
+        when = "today" if days == 0 else ("tomorrow" if days == 1 else f"in {days} days")
+        rows.append(f"""
+        <tr>
+            <td style="padding:8px 12px;font-weight:bold;color:#1A365D;">{e['ticker']}</td>
+            <td style="padding:8px 12px;color:#334155;">{e['display_name']}</td>
+            <td style="padding:8px 12px;color:#334155;white-space:nowrap;">{e['date_str']}</td>
+            <td style="padding:8px 12px;color:#64748b;white-space:nowrap;">{when}</td>
+        </tr>""")
+
+    rows_html = "".join(rows)
+    plural = "report" if len(events) == 1 else "reports"
+
+    return f"""
+    <div style="background-color:#ffffff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin-bottom:18px;font-family:'Segoe UI', Arial, sans-serif;">
+        <h2 style="margin:0 0 4px;font-size:16px;color:#1A365D;">📅 Upcoming Earnings (next {window_days} days)</h2>
+        <p style="margin:0 0 12px;font-size:12px;color:#64748b;">
+            {len(events)} portfolio {plural} scheduled. Dates are expected earnings-release dates;
+            the related 10-Q/10-K is typically filed shortly after and some dates may still be estimates.
+        </p>
+        <table style="width:100%;border-collapse:collapse;font-size:13px;">
+            <thead>
+                <tr style="text-align:left;border-bottom:1px solid #e2e8f0;color:#94a3b8;font-size:11px;text-transform:uppercase;">
+                    <th style="padding:6px 12px;">Ticker</th>
+                    <th style="padding:6px 12px;">Company</th>
+                    <th style="padding:6px 12px;">Expected Date</th>
+                    <th style="padding:6px 12px;">When</th>
+                </tr>
+            </thead>
+            <tbody>{rows_html}</tbody>
+        </table>
+    </div>
+    """
+
+
 def generate_portfolio_report(tickers=None):
     """
     Builds the full multi-stock HTML email:
@@ -266,6 +317,24 @@ def generate_portfolio_report(tickers=None):
     </div>
     """
 
+    # Upcoming-earnings section: only rendered if something falls in the
+    # next two weeks. build_earnings_section returns "" otherwise, so the
+    # block simply disappears from the email when nothing is scheduled.
+    EARNINGS_WINDOW_DAYS = 14
+    try:
+        earnings_events = data_fetcher.fetch_upcoming_earnings(
+            tickers, window_days=EARNINGS_WINDOW_DAYS
+        )
+        earnings_html = build_earnings_section(earnings_events, EARNINGS_WINDOW_DAYS)
+        if earnings_events:
+            print(f"Upcoming earnings in next {EARNINGS_WINDOW_DAYS} days: "
+                  + ", ".join(f"{e['ticker']} ({e['date_str']})" for e in earnings_events))
+        else:
+            print(f"No portfolio earnings within {EARNINGS_WINDOW_DAYS} days; skipping section.")
+    except Exception as e:
+        print(f"Warning: earnings section failed, omitting it: {e}")
+        earnings_html = ""
+
     footer_html = """
     <div style="background-color:#f8fafc;color:#64748b;font-size:11px;padding:16px;border-radius:0 0 16px 16px;text-align:center;font-family:'Segoe UI', Arial, sans-serif;">
         This report is for informational purposes only and does not constitute investment advice.
@@ -279,6 +348,7 @@ def generate_portfolio_report(tickers=None):
         <div style="max-width:680px;margin:0 auto;">
             {header_html}
             {chart_html}
+            {earnings_html}
             {body}
             {footer_html}
         </div>
