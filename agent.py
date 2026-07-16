@@ -166,7 +166,9 @@ def generate_portfolio_report(tickers=None):
             if 'error' in stock_data:
                 print(f"Warning: {ticker} stock data fetch had issues: {stock_data['error']}")
 
-            news_items = data_fetcher.fetch_catalyst_news(info["catalyst_queries"])
+            news_items = data_fetcher.fetch_company_news(
+                ticker, info["catalyst_queries"]
+            )
 
             section_html = generate_stock_section(ticker, info, stock_data, news_items)
             sections_html.append(section_html)
