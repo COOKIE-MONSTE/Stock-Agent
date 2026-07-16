@@ -8,9 +8,15 @@ from dotenv import load_dotenv
 # Load configuration
 load_dotenv()
 
-def send_email(subject, html_content, chart_path=None):
+def send_email(subject, html_content, chart_path=None, logo_path=None):
     """
-    Sends an HTML email with an optional inline chart image using SMTP.
+    Sends an HTML email with optional inline images (logo + chart), each
+    embedded via Content-ID so they render without the recipient having to
+    click "load images".
+
+    Inline images are passed as (path, content_id) pairs; the content_id must
+    match the src="cid:..." reference in the HTML. The logo uses cid:brand_logo
+    and the chart uses cid:comparison_chart.
     """
     smtp_server = os.getenv("SMTP_SERVER")
     smtp_port = os.getenv("SMTP_PORT")
@@ -38,41 +44,44 @@ def send_email(subject, html_content, chart_path=None):
         print(f"Error: SMTP_PORT must be an integer, got: {smtp_port}")
         return False
 
-    # Initialize the email message
-    # If we are embedding an inline image, we must use multipart/related
+    # Collect the inline images we actually have, as (path, content_id) pairs.
+    inline_images = []
+    if logo_path and os.path.exists(logo_path):
+        inline_images.append((logo_path, "brand_logo"))
     if chart_path and os.path.exists(chart_path):
+        inline_images.append((chart_path, "comparison_chart"))
+
+    # If we have any inline images, use multipart/related; else plain alternative.
+    if inline_images:
         msg = MIMEMultipart("related")
         msg["Subject"] = subject
         msg["From"] = sender_email
         msg["To"] = ", ".join(recipient_list)
-        
-        # Create an alternative subpart for text/html fallback
+
         msg_alternative = MIMEMultipart("alternative")
         msg.attach(msg_alternative)
-        
-        # Attach the HTML body to alternative section
         part_html = MIMEText(html_content, "html")
         msg_alternative.attach(part_html)
-        
-        # Attach the image to the main related container with matching Content-ID
-        try:
-            with open(chart_path, "rb") as f:
-                img_data = f.read()
-            msg_image = MIMEImage(img_data)
-            # Content-ID matches the src="cid:comparison_chart" in the HTML template
-            msg_image.add_header("Content-ID", "<comparison_chart>")
-            msg_image.add_header("Content-Disposition", "inline", filename=os.path.basename(chart_path))
-            msg.attach(msg_image)
-            print(f"Attached inline chart image: {chart_path}")
-        except Exception as e:
-            print(f"Warning: Failed to attach image to email: {e}")
+
+        for img_path, cid in inline_images:
+            try:
+                with open(img_path, "rb") as f:
+                    img_data = f.read()
+                msg_image = MIMEImage(img_data)
+                msg_image.add_header("Content-ID", f"<{cid}>")
+                msg_image.add_header("Content-Disposition", "inline",
+                                     filename=os.path.basename(img_path))
+                msg.attach(msg_image)
+                print(f"Attached inline image '{cid}': {img_path}")
+            except Exception as e:
+                print(f"Warning: Failed to attach image {img_path} ({cid}): {e}")
     else:
-        # Standard fallback if no image is attached
+        # Standard fallback if no images are attached
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = sender_email
         msg["To"] = ", ".join(recipient_list)
-        
+
         part_html = MIMEText(html_content, "html")
         msg.attach(part_html)
 
@@ -98,3 +107,4 @@ def send_email(subject, html_content, chart_path=None):
     except Exception as e:
         print(f"Failed to send email: {e}")
         return False
+        
