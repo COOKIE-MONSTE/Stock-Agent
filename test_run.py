@@ -19,6 +19,7 @@ def run_pipeline():
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
     chart_path = os.path.join(current_dir, "comparison_chart.png")
+    logo_path = os.path.join(current_dir, "assets", "logo.png")
     local_report_path = os.path.join(current_dir, "last_report.html")
 
     try:
@@ -47,7 +48,7 @@ def run_pipeline():
             f.write(html_content)
 
         # 5. Attempt to send email with inline chart attached
-        sent = email_service.send_email(subject, html_content, chart_path)
+        sent = email_service.send_email(subject, html_content, chart_path, logo_path)
 
         # 6. Output local preview logs
         print("\n" + "=" * 60)
