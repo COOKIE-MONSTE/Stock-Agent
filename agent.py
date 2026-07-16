@@ -248,6 +248,149 @@ def build_earnings_section(events, window_days=14):
     """
 
 
+MACRO_SECTION_SYSTEM_INSTRUCTION = """
+You are an expert equity research analyst and retail strategist writing the
+macro/sector section of a daily investor briefing focused on consumer & retail.
+
+=== NON-NEGOTIABLE GROUNDING RULES ===
+You will be given two evidence sources: (1) recent, dated news articles, and
+(2) official economic figures from FRED (U.S. Census Bureau retail sales and
+University of Michigan sentiment). These are your ONLY permitted sources of fact.
+
+- Every specific statistic (a sentiment index level, a retail-sales % change,
+  a dollar figure) MUST come from the FRED data block provided. NEVER state a
+  numeric economic figure that is not in that block. If you don't have a number,
+  describe the direction/dynamic qualitatively instead.
+- Every claim about a company or a recent event MUST trace to a provided news
+  item. Do not reference earnings calls, executive quotes, or corporate moves
+  that aren't in the supplied news.
+- When the FRED note says a series is delayed (e.g. Michigan sentiment lags ~1
+  month), acknowledge that lag rather than implying the figure is today's.
+- If the evidence is thin on some sub-topic, say so briefly rather than filling
+  the gap with plausible-sounding invention. "The provided data doesn't cover X"
+  is an acceptable and preferred statement.
+- Clearly separate FACT (from the data) from INTERPRETATION (your analysis).
+  Hedge inferences ("this likely reflects...", "consistent with...").
+
+=== ANALYTICAL MANDATE ===
+Within those guardrails, be deep and specific. Avoid generic statements like
+"consumers are feeling inflation." Instead surface concrete behavioral dynamics,
+e.g. "higher-income shoppers trading down to private label to protect
+discretionary budgets," WHEN the evidence supports it. Cover, without limiting
+yourself to:
+- Retail financial intelligence: what major retailers' recent commentary (from
+  the provided news) implies about the consumer.
+- Data indicators: interpret the FRED figures provided (retail sales momentum,
+  sentiment direction) - what do they signal?
+- K-shaped bifurcation: how low- / middle- / high-income cohorts are behaving
+  differently, grounded in the evidence.
+- Competitive corporate strategies: pricing/value tactics, private-label vs.
+  premiumization, operational/tech levers - as reflected in the provided news.
+You may add other genuinely relevant macro trends, regulatory shifts, or
+emerging strategies IF supported by the evidence provided.
+
+=== OUTPUT FORMAT ===
+A single self-contained HTML fragment: one <div>...</div>, inline CSS only, no
+<html>/<head>/<body>, no markdown backticks, no text outside the div. Use
+<strong> for emphasis, never markdown asterisks.
+
+Card shell: white background, 16px border-radius, 1px solid #e2e8f0 border,
+20px padding, 18px bottom margin, font-family 'Segoe UI', Arial, sans-serif.
+Open with a header: <h2 style="margin:0 0 12px;font-size:17px;color:#1A365D;">
+Consumer & Retail: Macro & Sector Read</h2>
+
+Use clear <h3> subheadings (color #334155, font-size 14px), concise paragraphs,
+and <ul> bullets for specifics. Where you cite a FRED figure, present it as a
+small data callout (e.g. a <div> with a light #f1f5f9 background). Keep it
+skimmable and professional. Depth and evidential grounding beat length.
+"""
+
+
+def _format_fred_for_prompt(fred_data):
+    """Turn the FRED dict into a compact text block for the prompt."""
+    if not fred_data:
+        return "(No official economic figures available this run — do NOT state any specific economic statistics; discuss dynamics qualitatively only.)"
+    lines = []
+    for sid, d in fred_data.items():
+        latest = d.get("latest", {})
+        prior = d.get("prior", {})
+        chg = d.get("change")
+        piece = f"- {d['label']} [{d['units']}]: latest {latest.get('value')} ({latest.get('date')})"
+        if prior:
+            piece += f"; prior {prior.get('value')} ({prior.get('date')})"
+        if chg is not None:
+            piece += f"; change {chg:+}"
+        if d.get("notes"):
+            piece += f". Note: {d['notes']}"
+        lines.append(piece)
+    return "\n".join(lines)
+
+
+def generate_macro_section(macro_news, fred_data):
+    """
+    Produces the consumer/retail macro section via one grounded Gemini call.
+    Returns the HTML fragment, or "" on failure so the report can omit it.
+
+    Grounding: FRED figures are the ONLY permitted numeric source; news items
+    are the ONLY permitted event source. The system instruction enforces this.
+    """
+    if not macro_news and not fred_data:
+        print("Macro section: no news and no FRED data available; skipping section.")
+        return ""
+
+    news_str = "\n".join([
+        f"- {n['title']} (Source: {n['publisher']}, Date: {n['pubDate']}) - Link: {n['link']}"
+        for n in macro_news
+    ]) or "(no macro/retail news returned this run)"
+
+    fred_str = _format_fred_for_prompt(fred_data)
+
+    prompt = f"""
+    Build the Consumer & Retail macro/sector section using ONLY the evidence below.
+
+    === OFFICIAL ECONOMIC FIGURES (FRED — U.S. Census Bureau & U. Michigan) ===
+    These are the ONLY numbers you may cite. Do not state any economic statistic
+    not listed here.
+    {fred_str}
+
+    === RECENT CONSUMER / RETAIL NEWS (dated, source-scored) ===
+    Every company/event claim must trace to one of these items.
+    {news_str}
+
+    Write the section now, following the grounding rules and format exactly.
+    Prioritize specific, evidenced behavioral insight over generic commentary,
+    and explicitly note where the evidence is thin rather than inventing detail.
+    """
+
+    max_retries = 3
+    retry_delay = 3
+    response = None
+    for attempt in range(max_retries):
+        try:
+            print(f"Requesting macro/sector analysis (Attempt {attempt + 1}/{max_retries})...")
+            response = get_gemini_client().models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=MACRO_SECTION_SYSTEM_INSTRUCTION,
+                    temperature=0.5,
+                )
+            )
+            break
+        except (ServerError, APIError) as e:
+            if attempt == max_retries - 1:
+                print(f"Macro section: Gemini unavailable after retries: {e}")
+                return ""
+            print(f"Gemini high demand for macro section. Retrying in {retry_delay}s...")
+            time.sleep(retry_delay)
+            retry_delay *= 2
+        except Exception as e:
+            print(f"Macro section failed: {e}")
+            return ""
+
+    return clean_html_output(response.text)
+
+
 def generate_portfolio_report(tickers=None):
     """
     Builds the full multi-stock HTML email:
@@ -335,6 +478,17 @@ def generate_portfolio_report(tickers=None):
         print(f"Warning: earnings section failed, omitting it: {e}")
         earnings_html = ""
 
+    # Consumer & retail macro/sector section. Grounded in FRED official figures
+    # + recent source-scored retail news. Omitted entirely on failure.
+    try:
+        print("Gathering macro/retail evidence (FRED + news)...")
+        fred_data = data_fetcher.fetch_fred_indicators()
+        macro_news = data_fetcher.fetch_retail_macro_news()
+        macro_html = generate_macro_section(macro_news, fred_data)
+    except Exception as e:
+        print(f"Warning: macro section failed, omitting it: {e}")
+        macro_html = ""
+
     footer_html = """
     <div style="background-color:#f8fafc;color:#64748b;font-size:11px;padding:16px;border-radius:0 0 16px 16px;text-align:center;font-family:'Segoe UI', Arial, sans-serif;">
         This report is for informational purposes only and does not constitute investment advice.
@@ -350,6 +504,7 @@ def generate_portfolio_report(tickers=None):
             {chart_html}
             {earnings_html}
             {body}
+            {macro_html}
             {footer_html}
         </div>
     </body>
