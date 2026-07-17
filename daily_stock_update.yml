@@ -1,10 +1,22 @@
-name: Daily BTI Stock Update
+name: Daily Portfolio Stock Update
 
 on:
   schedule:
-    # Run daily at 14:00 UTC (which is 8:00 AM your local time, UTC-6)
+    # Run daily at 14:00 UTC (which is 8:00 AM your local time, UTC-6).
+    # NOTE: this is the SINGLE owner of the automated daily run. If you also run
+    # the pipeline locally (scheduler.py or a manual `python test_run.py`) on the
+    # same GEMINI_API_KEY, both runs share the same tiny daily quota and will
+    # collide. Pick one: either let this Action be the daily runner, or disable
+    # this schedule and run locally -- not both.
     - cron: '0 14 * * *'
   workflow_dispatch: # Enables manual run trigger via the GitHub web interface
+
+# Prevent overlapping runs (e.g. the cron and a manual dispatch firing close
+# together) from stacking and double-spending the Gemini quota. A new run waits
+# for / supersedes an in-flight one instead of running concurrently.
+concurrency:
+  group: daily-stock-update
+  cancel-in-progress: false
 
 jobs:
   run-agent:
@@ -24,10 +36,13 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Run BTI Stock Update Agent
+    - name: Run Portfolio Stock Update Agent
       env:
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}                 # optional override; defaults in agent.py
+        GEMINI_FALLBACK_MODEL: ${{ vars.GEMINI_FALLBACK_MODEL }} # optional override; defaults in agent.py
         FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+        FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
         SMTP_PORT: ${{ secrets.SMTP_PORT }}
         SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
