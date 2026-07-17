@@ -1,18 +1,34 @@
-# Local environment configurations (private keys)
+# --- Secrets / config ---
 .env
+*.env
+.env.*
 
-# Local test outputs
+# --- Local run state ---
+.last_run_date          # once-per-day guard marker written by test_run.py
+
+# --- Generated artifacts (regenerated every run; no need to track) ---
 last_report.html
 comparison_chart.png
 test_chart.png
-last_report.html.bak
 
-# Python compiler files
+# --- Python build artifacts ---
 __pycache__/
+*.py[cod]
 *.pyc
 *.pyo
-*.pyd
+*.egg-info/
+.eggs/
+build/
+dist/
 
-# Operating system files
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- OS / editor cruft ---
 .DS_Store
 Thumbs.db
+.idea/
+.vscode/
