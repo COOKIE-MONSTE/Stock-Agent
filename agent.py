@@ -456,6 +456,22 @@ def generate_macro_section(macro_news, fred_data):
         return ""
 
 
+def build_macro_chart_card(chart_generated):
+    """
+    Wraps the pre-rendered macro trend chart image (cid:macro_chart) in a
+    card matching the report's other sections. Returns "" when the chart
+    wasn't generated (e.g. missing FRED_API_KEY), so the caller can
+    concatenate unconditionally and the card simply vanishes.
+    """
+    if not chart_generated:
+        return ""
+    return """
+    <div style="background-color:#ffffff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin-bottom:18px;text-align:center;font-family:'Segoe UI', Arial, sans-serif;">
+        <img src="cid:macro_chart" style="max-width:100%;border-radius:12px;" />
+    </div>
+    """
+
+
 def _placeholder_card(ticker):
     """Deterministic placeholder card used when a ticker can't be built."""
     return (
@@ -466,7 +482,7 @@ def _placeholder_card(ticker):
     )
 
 
-def generate_portfolio_report(tickers=None):
+def generate_portfolio_report(tickers=None, macro_chart_path=None):
     """
     Builds the full multi-stock HTML email:
       1. Fetches data + tailored catalyst news for each ticker (no quota cost).
@@ -574,7 +590,13 @@ def generate_portfolio_report(tickers=None):
         print("Gathering macro/retail evidence (FRED + news)...")
         fred_data = data_fetcher.fetch_fred_indicators()
         macro_news = data_fetcher.fetch_retail_macro_news()
-        macro_html = generate_macro_section(macro_news, fred_data)
+        macro_text_html = generate_macro_section(macro_news, fred_data)
+
+        chart_generated = False
+        if macro_chart_path:
+            chart_generated = data_fetcher.generate_macro_chart(macro_chart_path)
+
+        macro_html = build_macro_chart_card(chart_generated) + macro_text_html
     except Exception as e:
         print(f"Warning: macro section failed, omitting it: {e}")
         macro_html = ""
@@ -610,9 +632,11 @@ def generate_portfolio_report(tickers=None):
 
 if __name__ == "__main__":
     # Test stub
-    report_html, summary = generate_portfolio_report()
+    output_dir = os.path.dirname(__file__)
+    macro_chart_path = os.path.join(output_dir, "macro_chart.png")
+    report_html, summary = generate_portfolio_report(macro_chart_path=macro_chart_path)
     print("Report generated successfully.")
-    output_path = os.path.join(os.path.dirname(__file__), "last_report.html")
+    output_path = os.path.join(output_dir, "last_report.html")
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(report_html)
     print(f"Saved local copy of report to: {output_path}")

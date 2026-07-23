@@ -62,6 +62,7 @@ def run_pipeline(force=False):
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
     chart_path = os.path.join(current_dir, "comparison_chart.png")
+    macro_chart_path = os.path.join(current_dir, "macro_chart.png")
     logo_path = os.path.join(current_dir, "assets", "logo.png")
     local_report_path = os.path.join(current_dir, "last_report.html")
 
@@ -70,7 +71,9 @@ def run_pipeline(force=False):
         data_fetcher.generate_comparison_chart(chart_path, {t: t for t in STOCKS})
 
         # 2. Run agent to get the combined HTML report + per-ticker summary
-        html_content, summary = agent.generate_portfolio_report()
+        #    (this also generates the consumer/retail macro trend chart at
+        #    macro_chart_path, from FRED data, if FRED_API_KEY is configured)
+        html_content, summary = agent.generate_portfolio_report(macro_chart_path=macro_chart_path)
 
         # 3. Build subject line from the day's biggest mover
         movers = [s for s in summary if s.get("pct_change") is not None]
@@ -90,8 +93,9 @@ def run_pipeline(force=False):
         with open(local_report_path, "w", encoding="utf-8") as f:
             f.write(html_content)
 
-        # 5. Attempt to send email with inline chart attached
-        sent = email_service.send_email(subject, html_content, chart_path, logo_path)
+        # 5. Attempt to send email with inline charts attached
+        sent = email_service.send_email(subject, html_content, chart_path, logo_path,
+                                        macro_chart_path=macro_chart_path)
 
         # 6. Output local preview logs
         print("\n" + "=" * 60)

@@ -9,6 +9,7 @@
 # --- Generated artifacts (regenerated every run; no need to track) ---
 last_report.html
 comparison_chart.png
+macro_chart.png
 test_chart.png
 
 # --- Python build artifacts ---

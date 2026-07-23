@@ -8,15 +8,16 @@ from dotenv import load_dotenv
 # Load configuration
 load_dotenv()
 
-def send_email(subject, html_content, chart_path=None, logo_path=None):
+def send_email(subject, html_content, chart_path=None, logo_path=None, macro_chart_path=None):
     """
-    Sends an HTML email with optional inline images (logo + chart), each
+    Sends an HTML email with optional inline images (logo + charts), each
     embedded via Content-ID so they render without the recipient having to
     click "load images".
 
     Inline images are passed as (path, content_id) pairs; the content_id must
-    match the src="cid:..." reference in the HTML. The logo uses cid:brand_logo
-    and the chart uses cid:comparison_chart.
+    match the src="cid:..." reference in the HTML. The logo uses cid:brand_logo,
+    the portfolio chart uses cid:comparison_chart, and the consumer/retail
+    macro trend chart uses cid:macro_chart.
     """
     smtp_server = os.getenv("SMTP_SERVER")
     smtp_port = os.getenv("SMTP_PORT")
@@ -50,6 +51,8 @@ def send_email(subject, html_content, chart_path=None, logo_path=None):
         inline_images.append((logo_path, "brand_logo"))
     if chart_path and os.path.exists(chart_path):
         inline_images.append((chart_path, "comparison_chart"))
+    if macro_chart_path and os.path.exists(macro_chart_path):
+        inline_images.append((macro_chart_path, "macro_chart"))
 
     # If we have any inline images, use multipart/related; else plain alternative.
     if inline_images:

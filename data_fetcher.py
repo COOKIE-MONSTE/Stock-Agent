@@ -12,6 +12,8 @@ import matplotlib
 # Use the non-interactive Agg backend to avoid GUI window popup issues on Windows/servers
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch
+import textwrap
 
 def _format_pub_date(raw):
     """
@@ -652,6 +654,249 @@ def fetch_fred_indicators(series=None, per_series_points=3):
         out[series_id] = entry
 
     return out
+
+
+def fetch_fred_series_history(series_id, limit=24):
+    """
+    Fetches up to `limit` most recent observations for a single FRED series,
+    oldest-first, for charting a trend. (fetch_fred_indicators grabs just
+    enough points for a latest-vs-prior comparison; this pulls a longer run
+    for the macro chart.)
+
+    Returns a list of {"date": "YYYY-MM-DD", "value": float}, oldest first,
+    or [] if FRED_API_KEY is missing or the request fails.
+    """
+    api_key = os.getenv("FRED_API_KEY")
+    if not api_key or api_key == "YOUR_FRED_API_KEY":
+        return []
+
+    url = "https://api.stlouisfed.org/fred/series/observations"
+    params = {
+        "series_id": series_id,
+        "api_key": api_key,
+        "file_type": "json",
+        "sort_order": "desc",
+        "limit": limit,
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        payload = resp.json()
+    except (requests.RequestException, json.JSONDecodeError, ValueError) as e:
+        print(f"Warning: FRED history fetch failed for {series_id}: {e}")
+        return []
+
+    clean = []
+    for o in payload.get("observations", []):
+        v = o.get("value")
+        if v in (None, ".", ""):
+            continue
+        try:
+            clean.append({"date": o.get("date"), "value": float(v)})
+        except ValueError:
+            continue
+
+    clean.reverse()  # FRED returns newest-first; the chart wants oldest-first
+    return clean
+
+
+# The five series shown as KPI tiles on the macro chart. Each has wildly
+# different units (dollars, percent, an index) and two are quarterly rather
+# than monthly, so they're rendered as a row of stat tiles (one number +
+# sparkline each) rather than lines sharing one axis.
+#   unit          -- how to format the headline value
+#   delta_unit    -- "pct" (percent change) or "pts" (raw point change) for
+#                    the vs-N-readings-ago comparison
+#   good_direction -- which direction of travel is good news ("up"/"down"),
+#                    or None when the series doesn't support that framing
+#                    (e.g. rising revolving credit can reflect either strong
+#                    spending or growing household leverage)
+MACRO_KPI_SERIES = {
+    "RSFSXMV": {
+        "label": "Retail Sales, ex. Motor Vehicles & Parts",
+        "unit": "dollars_millions",
+        "delta_unit": "pct",
+        "good_direction": "up",
+    },
+    "REVOLSL": {
+        "label": "Revolving Consumer Credit",
+        "unit": "dollars_millions",
+        "delta_unit": "pct",
+        "good_direction": None,
+    },
+    "DRCCLACBS": {
+        "label": "Credit Card Delinquency Rate",
+        "unit": "percent",
+        "delta_unit": "pts",
+        "good_direction": "down",
+    },
+    "CPILFESL": {
+        "label": "Core CPI, ex. Food & Energy",
+        "unit": "index",
+        "delta_unit": "pct",
+        "good_direction": "down",
+    },
+    "UMCSENT": {
+        "label": "U. Michigan Consumer Sentiment",
+        "unit": "index",
+        "delta_unit": "pts",
+        "good_direction": "up",
+    },
+}
+
+
+def _format_compact_dollars(value_millions):
+    """Formats a raw FRED dollar value (already in $ millions) as $M/$B/$T."""
+    abs_v = abs(value_millions)
+    if abs_v >= 1_000_000:
+        return f"${value_millions / 1_000_000:.2f}T"
+    if abs_v >= 1_000:
+        return f"${value_millions / 1_000:.1f}B"
+    return f"${value_millions:.1f}M"
+
+
+def _format_kpi_value(value, unit):
+    """Formats a series' latest value for its stat-tile headline number."""
+    if unit == "dollars_millions":
+        return _format_compact_dollars(value)
+    if unit == "percent":
+        return f"{value:.2f}%"
+    if unit == "index":
+        return f"{value:,.1f}"
+    return f"{value:.2f}"
+
+
+def _format_kpi_delta(latest, oldest, delta_unit):
+    """
+    Compares the latest reading to the oldest of the fetched readings.
+    Returns (display_text, direction) where direction is "up"/"down"/"flat".
+    """
+    diff = latest - oldest
+    if delta_unit == "pct":
+        if oldest == 0:
+            return "n/a", "flat"
+        pct = (diff / abs(oldest)) * 100
+        direction = "up" if pct > 0.05 else "down" if pct < -0.05 else "flat"
+        arrow = "▲" if direction == "up" else "▼" if direction == "down" else "–"
+        return f"{arrow} {pct:+.1f}%", direction
+
+    direction = "up" if diff > 0.005 else "down" if diff < -0.005 else "flat"
+    arrow = "▲" if direction == "up" else "▼" if direction == "down" else "–"
+    return f"{arrow} {diff:+.2f} pts", direction
+
+
+def _kpi_delta_color(direction, good_direction):
+    """Green when the move is good news, red when bad, muted gray otherwise."""
+    if direction == "flat" or good_direction is None:
+        return "#64748b"
+    return "#16a34a" if direction == good_direction else "#dc2626"
+
+
+def generate_macro_chart(output_path, series_ids=None, points=3):
+    """
+    Builds a row of consumer/retail KPI stat tiles for the macro section: one
+    tile per series, each showing the latest reading, its change vs. the
+    oldest of the `points` most recent available readings, and a small
+    sparkline. All data comes straight from FRED (Census Bureau, Federal
+    Reserve Board G.19, and BLS via the St. Louis Fed) -- nothing here is
+    model-generated.
+
+    Note on frequency: `points` counts AVAILABLE READINGS, not calendar
+    months -- DRCCLACBS is a quarterly series, so its 3 "most recent readings"
+    span roughly 3 quarters, not 3 months. The other four series are monthly.
+
+    Returns True and saves a PNG on success, or False (no file written) if
+    FRED_API_KEY is missing or none of the series return data.
+    """
+    series_ids = list(series_ids or MACRO_KPI_SERIES.keys())
+
+    histories = {}
+    for sid in series_ids:
+        hist = fetch_fred_series_history(sid, limit=points)
+        if hist:
+            histories[sid] = hist
+
+    if not histories:
+        print("Macro chart: no FRED history available; skipping chart.")
+        return False
+
+    print("Generating consumer/retail macro KPI tiles...")
+    ncols = 3
+    nrows = -(-len(series_ids) // ncols)  # ceil division
+    fig, axes = plt.subplots(nrows, ncols, figsize=(9, 2.9 * nrows))
+    fig.set_facecolor('#f8fafc')
+    axes_flat = axes.flatten() if hasattr(axes, "flatten") else [axes]
+
+    fig.suptitle("Consumer & Retail: Key Macro Indicators (FRED)",
+                  fontsize=13, fontweight='bold', color='#1e293b', y=0.99)
+
+    for i, sid in enumerate(series_ids):
+        ax = axes_flat[i]
+        ax.axis('off')
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+
+        meta = MACRO_KPI_SERIES.get(sid, {
+            "label": sid, "unit": "index", "delta_unit": "pts", "good_direction": None,
+        })
+
+        card = FancyBboxPatch((0.02, 0.06), 0.96, 0.88,
+                               boxstyle="round,pad=0,rounding_size=0.06",
+                               transform=ax.transAxes, facecolor='#ffffff',
+                               edgecolor='#e2e8f0', linewidth=1, zorder=0)
+        ax.add_patch(card)
+
+        hist = histories.get(sid)
+        if not hist:
+            ax.text(0.5, 0.5, f"{meta['label']}\n(no data)", transform=ax.transAxes,
+                     ha='center', va='center', fontsize=9, color='#94a3b8')
+            continue
+
+        latest = hist[-1]["value"]
+
+        # Wrap to a fixed width so every tile's title occupies the same
+        # two-line block regardless of label length, keeping the row aligned
+        # and every label safely inside its card.
+        label_lines = "\n".join(textwrap.wrap(meta["label"], width=26))
+        ax.text(0.08, 0.86, label_lines, transform=ax.transAxes, fontsize=8.3,
+                 color='#64748b', fontweight='bold', va='top', linespacing=1.3)
+        ax.text(0.08, 0.58, _format_kpi_value(latest, meta["unit"]), transform=ax.transAxes,
+                 fontsize=17, color='#1A365D', fontweight='bold', va='top')
+
+        if len(hist) >= 2:
+            oldest = hist[0]["value"]
+            delta_text, direction = _format_kpi_delta(latest, oldest, meta["delta_unit"])
+            color = _kpi_delta_color(direction, meta.get("good_direction"))
+            ax.text(0.08, 0.30, delta_text, transform=ax.transAxes, fontsize=10,
+                     color=color, fontweight='bold', va='top')
+            ax.text(0.08, 0.14, f"vs {hist[0]['date']}", transform=ax.transAxes,
+                     fontsize=7, color='#94a3b8', va='top')
+
+            spark_ax = ax.inset_axes([0.60, 0.16, 0.34, 0.48])
+            xs = list(range(len(hist)))
+            ys = [d["value"] for d in hist]
+            spark_ax.plot(xs, ys, color='#cbd5e1', linewidth=2, zorder=1)
+            if len(xs) > 1:
+                spark_ax.plot(xs[:-1], ys[:-1], 'o', color='#cbd5e1', markersize=4, zorder=2)
+            spark_ax.plot(xs[-1], ys[-1], 'o', color='#900018', markersize=6, zorder=3,
+                           markeredgecolor='#ffffff', markeredgewidth=1.5)
+            spread = max(ys) - min(ys)
+            pad = spread * 0.3 if spread else (abs(ys[-1]) * 0.05 + 0.01)
+            spark_ax.set_ylim(min(ys) - pad, max(ys) + pad)
+            spark_ax.set_xlim(-0.6, len(xs) - 0.4)
+            spark_ax.axis('off')
+        else:
+            ax.text(0.08, 0.34, "single reading available", transform=ax.transAxes,
+                     fontsize=8, color='#94a3b8', va='top')
+
+    for j in range(len(series_ids), len(axes_flat)):
+        axes_flat[j].axis('off')
+
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    fig.savefig(output_path, dpi=150, facecolor=fig.get_facecolor(), edgecolor='none')
+    plt.close(fig)
+    print(f"Macro chart saved successfully to {output_path}")
+    return True
 
 
 # Retail bellwethers and macro-consumer queries for the sector section. These
