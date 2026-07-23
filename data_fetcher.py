@@ -700,6 +700,72 @@ def fetch_fred_series_history(series_id, limit=24):
     return clean
 
 
+def fetch_fred_series_range(series_id, start_date):
+    """
+    Fetches ALL observations for a FRED series from `start_date` (a
+    "YYYY-MM-DD" string) through the present, oldest-first. Used to compute
+    the 5-year/10-year historical averages on the macro chart, as opposed to
+    fetch_fred_series_history, which grabs a fixed COUNT of the most recent
+    readings for the sparkline/delta.
+
+    Returns a list of {"date": "YYYY-MM-DD", "value": float}, oldest first,
+    or [] if FRED_API_KEY is missing or the request fails.
+    """
+    api_key = os.getenv("FRED_API_KEY")
+    if not api_key or api_key == "YOUR_FRED_API_KEY":
+        return []
+
+    url = "https://api.stlouisfed.org/fred/series/observations"
+    params = {
+        "series_id": series_id,
+        "api_key": api_key,
+        "file_type": "json",
+        "sort_order": "asc",
+        "observation_start": start_date,
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        payload = resp.json()
+    except (requests.RequestException, json.JSONDecodeError, ValueError) as e:
+        print(f"Warning: FRED range fetch failed for {series_id}: {e}")
+        return []
+
+    clean = []
+    for o in payload.get("observations", []):
+        v = o.get("value")
+        if v in (None, ".", ""):
+            continue
+        try:
+            clean.append({"date": o.get("date"), "value": float(v)})
+        except ValueError:
+            continue
+    return clean
+
+
+def _historical_averages(series_id):
+    """
+    Returns (avg_5y, avg_10y) for a series, or (None, None) if unavailable.
+    Fetches once over a 10-year window and derives the 5-year average as a
+    subset of the same data, so this costs one FRED call per series rather
+    than two.
+    """
+    today = datetime.date.today()
+    ten_year_start = (today - datetime.timedelta(days=365 * 10)).isoformat()
+    five_year_start = (today - datetime.timedelta(days=365 * 5)).isoformat()
+
+    hist = fetch_fred_series_range(series_id, ten_year_start)
+    if not hist:
+        return None, None
+
+    ten_values = [d["value"] for d in hist]
+    five_values = [d["value"] for d in hist if d["date"] >= five_year_start]
+
+    avg_10y = sum(ten_values) / len(ten_values) if ten_values else None
+    avg_5y = sum(five_values) / len(five_values) if five_values else None
+    return avg_5y, avg_10y
+
+
 # The five series shown as KPI tiles on the macro chart. Each has wildly
 # different units (dollars, percent, an index) and two are quarterly rather
 # than monthly, so they're rendered as a row of stat tiles (one number +
@@ -792,18 +858,43 @@ def _kpi_delta_color(direction, good_direction):
     return "#16a34a" if direction == good_direction else "#dc2626"
 
 
+def _short_month_year(iso_date):
+    """'2026-04-01' -> 'Apr 2026', for compact in-tile date labels."""
+    try:
+        return datetime.datetime.strptime(iso_date, "%Y-%m-%d").strftime("%b %Y")
+    except ValueError:
+        return iso_date
+
+
+def _format_kpi_avg_line(period_label, avg_value, latest_value, unit, delta_unit, good_direction):
+    """
+    Builds one colored "<period> avg <value>  <arrow> <delta>" line comparing
+    the latest reading to a historical average. Returns (text, color), or
+    (None, None) if the average isn't available (e.g. FRED_API_KEY missing).
+    """
+    if avg_value is None:
+        return None, None
+    avg_str = _format_kpi_value(avg_value, unit)
+    delta_text, direction = _format_kpi_delta(latest_value, avg_value, delta_unit)
+    color = _kpi_delta_color(direction, good_direction)
+    return f"{period_label} avg {avg_str}  {delta_text}", color
+
+
 def generate_macro_chart(output_path, series_ids=None, points=3):
     """
     Builds a row of consumer/retail KPI stat tiles for the macro section: one
     tile per series, each showing the latest reading, its change vs. the
-    oldest of the `points` most recent available readings, and a small
-    sparkline. All data comes straight from FRED (Census Bureau, Federal
-    Reserve Board G.19, and BLS via the St. Louis Fed) -- nothing here is
-    model-generated.
+    oldest of the `points` most recent available readings, a small sparkline,
+    and -- for context against historical norms -- its 5-year and 10-year
+    average with the latest reading's change vs. each. All data comes
+    straight from FRED (Census Bureau, Federal Reserve Board G.19, and BLS
+    via the St. Louis Fed) -- nothing here is model-generated.
 
     Note on frequency: `points` counts AVAILABLE READINGS, not calendar
     months -- DRCCLACBS is a quarterly series, so its 3 "most recent readings"
     span roughly 3 quarters, not 3 months. The other four series are monthly.
+    The 5y/10y averages are similarly just "however many readings fall in
+    that calendar window," whatever the series' native frequency.
 
     Returns True and saves a PNG on success, or False (no file written) if
     FRED_API_KEY is missing or none of the series return data.
@@ -811,10 +902,12 @@ def generate_macro_chart(output_path, series_ids=None, points=3):
     series_ids = list(series_ids or MACRO_KPI_SERIES.keys())
 
     histories = {}
+    averages = {}
     for sid in series_ids:
         hist = fetch_fred_series_history(sid, limit=points)
         if hist:
             histories[sid] = hist
+            averages[sid] = _historical_averages(sid)
 
     if not histories:
         print("Macro chart: no FRED history available; skipping chart.")
@@ -823,7 +916,7 @@ def generate_macro_chart(output_path, series_ids=None, points=3):
     print("Generating consumer/retail macro KPI tiles...")
     ncols = 3
     nrows = -(-len(series_ids) // ncols)  # ceil division
-    fig, axes = plt.subplots(nrows, ncols, figsize=(9, 2.9 * nrows))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(9, 3.6 * nrows))
     fig.set_facecolor('#f8fafc')
     axes_flat = axes.flatten() if hasattr(axes, "flatten") else [axes]
 
@@ -840,8 +933,8 @@ def generate_macro_chart(output_path, series_ids=None, points=3):
             "label": sid, "unit": "index", "delta_unit": "pts", "good_direction": None,
         })
 
-        card = FancyBboxPatch((0.02, 0.06), 0.96, 0.88,
-                               boxstyle="round,pad=0,rounding_size=0.06",
+        card = FancyBboxPatch((0.02, 0.04), 0.96, 0.92,
+                               boxstyle="round,pad=0,rounding_size=0.05",
                                transform=ax.transAxes, facecolor='#ffffff',
                                edgecolor='#e2e8f0', linewidth=1, zorder=0)
         ax.add_patch(card)
@@ -853,46 +946,78 @@ def generate_macro_chart(output_path, series_ids=None, points=3):
             continue
 
         latest = hist[-1]["value"]
+        avg_5y, avg_10y = averages.get(sid, (None, None))
 
         # Wrap to a fixed width so every tile's title occupies the same
         # two-line block regardless of label length, keeping the row aligned
         # and every label safely inside its card.
         label_lines = "\n".join(textwrap.wrap(meta["label"], width=26))
-        ax.text(0.08, 0.86, label_lines, transform=ax.transAxes, fontsize=8.3,
+        ax.text(0.08, 0.92, label_lines, transform=ax.transAxes, fontsize=8.3,
                  color='#64748b', fontweight='bold', va='top', linespacing=1.3)
-        ax.text(0.08, 0.58, _format_kpi_value(latest, meta["unit"]), transform=ax.transAxes,
-                 fontsize=17, color='#1A365D', fontweight='bold', va='top')
+        ax.text(0.08, 0.70, _format_kpi_value(latest, meta["unit"]), transform=ax.transAxes,
+                 fontsize=16, color='#1A365D', fontweight='bold', va='top')
 
         if len(hist) >= 2:
             oldest = hist[0]["value"]
             delta_text, direction = _format_kpi_delta(latest, oldest, meta["delta_unit"])
             color = _kpi_delta_color(direction, meta.get("good_direction"))
-            ax.text(0.08, 0.30, delta_text, transform=ax.transAxes, fontsize=10,
-                     color=color, fontweight='bold', va='top')
-            ax.text(0.08, 0.14, f"vs {hist[0]['date']}", transform=ax.transAxes,
-                     fontsize=7, color='#94a3b8', va='top')
+            ax.text(0.08, 0.47, f"{delta_text} vs {_short_month_year(hist[0]['date'])}",
+                     transform=ax.transAxes, fontsize=8.5, color=color,
+                     fontweight='bold', va='top')
+        else:
+            ax.text(0.08, 0.47, "single reading available", transform=ax.transAxes,
+                     fontsize=8, color='#94a3b8', va='top')
 
-            spark_ax = ax.inset_axes([0.60, 0.16, 0.34, 0.48])
+        # Historical context: 5y/10y average vs. the latest reading, so the
+        # recent trend can be read against where the series normally sits.
+        line_5y, color_5y = _format_kpi_avg_line(
+            "5y", avg_5y, latest, meta["unit"], meta["delta_unit"], meta.get("good_direction"))
+        line_10y, color_10y = _format_kpi_avg_line(
+            "10y", avg_10y, latest, meta["unit"], meta["delta_unit"], meta.get("good_direction"))
+
+        if line_5y:
+            ax.text(0.08, 0.33, line_5y, transform=ax.transAxes, fontsize=8.5,
+                     color=color_5y, fontweight='bold', va='top')
+        if line_10y:
+            ax.text(0.08, 0.19, line_10y, transform=ax.transAxes, fontsize=8.5,
+                     color=color_10y, fontweight='bold', va='top')
+
+        if len(hist) >= 2:
+            spark_ax = ax.inset_axes([0.66, 0.08, 0.28, 0.78])
             xs = list(range(len(hist)))
             ys = [d["value"] for d in hist]
-            spark_ax.plot(xs, ys, color='#cbd5e1', linewidth=2, zorder=1)
+
+            range_values = list(ys)
+            if avg_5y is not None:
+                range_values.append(avg_5y)
+            if avg_10y is not None:
+                range_values.append(avg_10y)
+
+            # Reference lines for the historical averages, drawn behind the
+            # recent-reading line so the sparkline visually shows whether
+            # today sits above, at, or below its long-run norm.
+            if avg_10y is not None:
+                spark_ax.axhline(avg_10y, color='#cbd5e1', linewidth=1,
+                                  linestyle=(0, (3, 2)), zorder=1)
+            if avg_5y is not None:
+                spark_ax.axhline(avg_5y, color='#94a3b8', linewidth=1,
+                                  linestyle=(0, (3, 2)), zorder=1)
+
+            spark_ax.plot(xs, ys, color='#cbd5e1', linewidth=2, zorder=2)
             if len(xs) > 1:
-                spark_ax.plot(xs[:-1], ys[:-1], 'o', color='#cbd5e1', markersize=4, zorder=2)
-            spark_ax.plot(xs[-1], ys[-1], 'o', color='#900018', markersize=6, zorder=3,
+                spark_ax.plot(xs[:-1], ys[:-1], 'o', color='#cbd5e1', markersize=4, zorder=3)
+            spark_ax.plot(xs[-1], ys[-1], 'o', color='#900018', markersize=6, zorder=4,
                            markeredgecolor='#ffffff', markeredgewidth=1.5)
-            spread = max(ys) - min(ys)
-            pad = spread * 0.3 if spread else (abs(ys[-1]) * 0.05 + 0.01)
-            spark_ax.set_ylim(min(ys) - pad, max(ys) + pad)
+            spread = max(range_values) - min(range_values)
+            pad = spread * 0.25 if spread else (abs(ys[-1]) * 0.05 + 0.01)
+            spark_ax.set_ylim(min(range_values) - pad, max(range_values) + pad)
             spark_ax.set_xlim(-0.6, len(xs) - 0.4)
             spark_ax.axis('off')
-        else:
-            ax.text(0.08, 0.34, "single reading available", transform=ax.transAxes,
-                     fontsize=8, color='#94a3b8', va='top')
 
     for j in range(len(series_ids), len(axes_flat)):
         axes_flat[j].axis('off')
 
-    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(output_path, dpi=150, facecolor=fig.get_facecolor(), edgecolor='none')
     plt.close(fig)
     print(f"Macro chart saved successfully to {output_path}")
