@@ -36,6 +36,17 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
+    # TEMPORARY DEBUG STEP -- prints only secret LENGTHS (never the values) to
+    # confirm whether GitHub is actually injecting a non-empty FRED_API_KEY.
+    # Remove this step once the mystery is solved.
+    - name: DEBUG - check secret lengths
+      env:
+        FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      run: |
+        echo "FRED_API_KEY length: ${#FRED_API_KEY}"
+        echo "GEMINI_API_KEY length: ${#GEMINI_API_KEY}"
+
     - name: Run Portfolio Stock Update Agent
       env:
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
