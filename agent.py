@@ -12,16 +12,15 @@ from stocks_config import STOCKS
 load_dotenv()
 
 # --- Model selection ------------------------------------------------------
-# IMPORTANT: your Gemini error showed an APPLIED free-tier limit of 20/day for
-# gemini-3.5-flash, even though the documented free tier is ~1,500/day. That
-# gap means this model is likely gated for your project/region and Google is
-# handing you a punitive fallback quota. Two durable fixes:
-#   1. Enable billing on the Google AI project (best), or
-#   2. Use a model your project is actually provisioned for (e.g. 2.5-flash).
+# gemini-3.5-flash previously showed an APPLIED free-tier limit of 20/day
+# for this project, well under the documented ~1,500/day, suggesting it's
+# gated for this project/region. gemini-2.5-flash is used as the primary
+# until that's resolved (billing enabled, or the project gets provisioned
+# for 3.5-flash); 3.5-flash is kept as the fallback.
 # GEMINI_MODEL is the primary; GEMINI_FALLBACK_MODEL is tried automatically if
 # the primary returns a client error (429 quota / model-not-available).
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
-GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL") or "gemini-3.5-flash"
 
 
 def get_gemini_client():
